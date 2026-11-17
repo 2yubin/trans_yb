@@ -135,7 +135,141 @@ var TransYbCore = {
   // 저작권, DOI, 내려받기 안내처럼 번역할 필요 없는 줄
   BOILER_LINE: /^(©|\(c\)\s*\d{4}|copyright\b|doi\s*:|https?:\/\/doi\.org|issn\b|e-?issn\b|downloaded from\b|this content downloaded)/i,
 
-  buildLayout(piecesIn) {
+  /**
+   * 한 장에 두 단(또는 펼친 책 두 쪽)이 나란히 있으면, 가운데의 빈 세로 띠를 찾아 왼쪽·오른쪽으로 나눠요.
+   * 띠를 가로지르는 조각이 하나라도 있으면(가로 전체 제목 등) 나누지 않아요. 나눌 수 없으면 null.
+   */
+  splitColumns(pieces) {
+    const ps = pieces.map((p, i) => ({ ...p, i })).filter((p) => String(p.raw).trim() && p.w > 0);
+    if (ps.length < 20) return null;
+    const minX = Math.min(...ps.map((p) => p.x));
+    const maxX = Math.max(...ps.map((p) => p.x + p.w));
+    const span = maxX - minX;
+    const hs = ps.map((p) => p.h || 10).sort((a, b) => a - b);
+    const H = hs[Math.floor(hs.length / 2)];
+    const N = Math.ceil(span);
+    const cover = new Uint8Array(N + 1);
+    for (const p of ps) for (let x = Math.floor(p.x - minX); x < Math.ceil(p.x + p.w - minX) && x <= N; x++) cover[x] = 1;
+    // 가운데(30%~70%)에서 가장 넓은 빈 띠
+    let best = null;
+    let runStart = -1;
+    for (let x = Math.floor(N * 0.3); x <= Math.ceil(N * 0.7) + 1; x++) {
+      const empty = x <= N && !cover[x];
+      if (empty && runStart < 0) runStart = x;
+      if (!empty && runStart >= 0) {
+        if (!best || x - runStart > best.w) best = { at: runStart, w: x - runStart };
+        runStart = -1;
+      }
+    }
+    if (!best || best.w < H * 1.2) return null;
+    const cut = minX + best.at + best.w / 2;
+    const left = ps.filter((p) => p.x + p.w / 2 < cut);
+    const right = ps.filter((p) => p.x + p.w / 2 >= cut);
+    const chars = (a) => a.reduce((n, p) => n + String(p.raw).length, 0);
+    const lineCount = (a) => new Set(a.map((p) => Math.round(p.y / H))).size;
+    // 양쪽 모두 글줄이 여러 개 있어야 진짜 두 단이에요
+    if (lineCount(left) < 4 || lineCount(right) < 4) return null;
+    if (Math.min(chars(left), chars(right)) < chars(ps) * 0.1) return null;
+    const leftSet = new Set(left.map((p) => p.i));
+    const L = [];
+    const R = [];
+    pieces.forEach((p, i) => {
+      // 빈 조각은 바로 앞 글자 조각과 같은 쪽에 둬요
+      const side = String(p.raw).trim() && p.w > 0 ? leftSet.has(i) : (L.length && L[L.length - 1] === i - 1);
+      (side ? L : R).push(i);
+    });
+    return [L, R];
+  },
+
+  /**
+   * 비스듬히 스캔한 페이지는 한 줄 안에서도 오른쪽으로 갈수록 글자가 올라가거나 내려가요.
+   * 같은 줄에서 바로 이어지는 조각끼리의 기울기 중앙값을 재서, 줄이 수평이 되도록 y 를 고쳐요.
+   * (문단 나누기에만 쓰고, 화면에 칠하는 위치는 원래 좌표를 써요.)
+   */
+  deskew(pieces) {
+    const slopes = [];
+    for (let i = 0; i < pieces.length - 1; i++) {
+      const a = pieces[i];
+      const b = pieces[i + 1];
+      const h = Math.min(a.h || 10, b.h || 10);
+      const dx = b.x - a.x;
+      const gap = b.x - (a.x + a.w);
+      if (!String(a.raw).trim() || !String(b.raw).trim() || dx < h || gap < -h * 0.3 || gap > h * 3) continue;
+      const dy = b.y - a.y;
+      if (Math.abs(dy) > h * 0.6) continue;
+      slopes.push(dy / dx);
+    }
+    if (slopes.length < 20) return pieces;
+    slopes.sort((x, y) => x - y);
+    const k = slopes[Math.floor(slopes.length / 2)];
+    if (Math.abs(k) < 0.004 || Math.abs(k) > 0.15) return pieces;
+    const x0 = Math.min(...pieces.map((p) => p.x));
+    return pieces.map((p) => ({ ...p, y: p.y - k * (p.x + (p.w || 0) / 2 - x0) }));
+  },
+
+  buildLayout(piecesRaw) {
+    const L = TransYbCore.buildLayoutCols(piecesRaw);
+    L.text = TransYbCore.repairBrokenCaps(L.text);
+    return L;
+  },
+
+  buildLayoutCols(piecesRaw) {
+    const piecesIn = TransYbCore.deskew(piecesRaw);
+    const cols = TransYbCore.splitColumns(piecesIn);
+    if (!cols) return TransYbCore.buildLayoutOne(piecesIn);
+    // 왼쪽 단을 다 읽고 오른쪽 단을 읽어요. 위치 정보는 원래 조각 번호로 되돌려요.
+    const ranges = piecesIn.map(() => null);
+    let text = "";
+    const soft = [];
+    const paras = [];
+    let notesOpen = false;
+    for (const idxs of cols) {
+      const one = TransYbCore.buildLayoutOne(idxs.map((i) => piecesIn[i]));
+      if (!one.text) continue;
+      if (text) text += "\n";
+      const off = text.length;
+      text += one.text;
+      one.ranges.forEach((r, k) => {
+        if (r) ranges[idxs[k]] = { ...r, start: r.start + off, end: r.end + off };
+      });
+      for (const x of one.soft) soft.push(x + off);
+      for (const pa of one.paras) paras.push({ ...pa, start: pa.start + off, end: pa.end + off });
+      notesOpen = one.notesOpen;
+    }
+    return { text, ranges, soft, paras, notesOpen };
+  },
+
+  /**
+   * 어떤 PDF는 글꼴 문제로 대문자 하나를 소문자로 넣어 둬요(예: "However" -> "however", "Heath 2003" -> "heath 2003").
+   * 그러면 마침표 뒤가 소문자라서 문장이 안 나뉘고 한 덩어리로 번역돼요.
+   * 마침표 뒤(줄임말 뒤 제외)나 인용(이름 연도) 자리에 같은 소문자가 되풀이되면 그 글자가 깨졌다고 보고 대문자로 고쳐요.
+   * 글자 수는 그대로라 위치 정보는 바뀌지 않아요.
+   */
+  repairBrokenCaps(text) {
+    const afterStop = /([.!?])(["”’)\]]*)(\s+)([a-z])(?=[a-z])/g;
+    const cite = /(^|[\s(;])([a-z])(?=[a-z]+(?:-[A-Za-z]+)?(?:,? (?:and|&) [A-Za-z-]+)?(?: et al\.?)?,? \(?\d{4}[a-z]?\b)/g;
+    const counts = {};
+    const spots = [];
+    let m;
+    while ((m = afterStop.exec(text))) {
+      const at = m.index + m[0].length - 1;
+      if (TransYbCore._endsWithAbbreviation(text.slice(0, m.index + 1))) continue;
+      counts[m[4]] = (counts[m[4]] || 0) + 1;
+      spots.push([at, m[4]]);
+    }
+    const citeHits = {};
+    while ((m = cite.exec(text))) {
+      citeHits[m[2]] = (citeHits[m[2]] || 0) + 1;
+      spots.push([m.index + m[1].length, m[2]]);
+    }
+    const broken = new Set(Object.keys(counts).filter((c) => counts[c] >= 2 || (counts[c] >= 1 && citeHits[c] >= 1)));
+    if (!broken.size) return text;
+    const chars = text.split("");
+    for (const [at, c] of spots) if (broken.has(c) && chars[at] === c) chars[at] = c.toUpperCase();
+    return chars.join("");
+  },
+
+  buildLayoutOne(piecesIn) {
     // 0) 큰 첫 글자(E|nglish): 크기와 위치를 다음 조각에 맞춰 같은 줄의 한 단어로 붙여요.
     const pieces = piecesIn.map((p) => ({ ...p }));
     for (let i = 0; i < pieces.length - 1; i++) {
@@ -156,6 +290,11 @@ var TransYbCore = {
     let cur = null;
     pieces.forEach((p, idx) => {
       const { text: t, map } = TransYbCore.normalizeWithMap(p.raw);
+      // 빈칸 조각은 위치가 엉뚱한 경우가 많아요(높이 0). 줄을 새로 만들지 않고 지금 줄에 붙여요.
+      if (cur && !String(p.raw).trim()) {
+        cur.items.push({ idx, t, map, x: p.x, w: p.w, raw: p.raw, font: p.font || "" });
+        return;
+      }
       const h = p.h || 10;
       const mid = p.y + h / 2;
       const sameLine =
@@ -202,6 +341,11 @@ var TransYbCore = {
     const titleFlows = (l) => l.right - l.left >= colWidth * 0.75 || /([:,\-–—&/]|\b(of|and|the|in|for|on|to|a|an|with|und|og|y|de)\b)\s*$/i.test(l.text);
     const lineHs = sorted(real.map((l) => l.fh));
     const H = lineHs[Math.floor(lineHs.length / 2)];
+    // 스캔 OCR 페이지는 줄마다 글자 높이가 들쭉날쭉해요. 흔들림이 크면 "큰 글씨(제목)" 기준을 그만큼 높여요.
+    // 흔들림 = 줄 높이가 가운데 값에서 벗어난 정도의 중앙값(보통 PDF는 거의 0)
+    const devs = sorted(real.map((l) => Math.abs(l.fh - H) / Math.max(H, 1)));
+    const noise = devs[Math.floor(devs.length / 2)];
+    const BIG = H * Math.min(1.5, 1.15 + Math.max(0, noise - 0.03) * 2.5);
     const gaps = [];
     for (let i = 1; i < real.length; i++) {
       const g = real[i].top - real[i - 1].bottom;
@@ -243,15 +387,15 @@ var TransYbCore = {
           if (fontChange && (prevShortish || gap > normalGap + h * 0.25)) brk = true;
           if (gapLarge) brk = true; // 줄 간격이 벌어짐
           // 글자 크기가 확실히 바뀜(제목). 본문 크기 안의 작은 흔들림(발음 기호, 기울임꼴)은 무시해요.
-          const bigPrev = prev.fh > H * 1.15;
-          const bigNow = ln.fh > H * 1.15;
-          const sizeJump = (bigPrev !== bigNow) || Math.abs(ln.fh - prev.fh) > Math.max(prev.fh, ln.fh) * 0.25;
+          const bigPrev = prev.fh > BIG;
+          const bigNow = ln.fh > BIG;
+          const sizeJump = (bigPrev !== bigNow) || Math.abs(ln.fh - prev.fh) > Math.max(prev.fh, ln.fh) * (0.25 + (BIG / H - 1.15));
           const sameBigTitle = bigPrev && bigNow && Math.abs(ln.fh - prev.fh) < prev.fh * 0.12 && titleFlows(prev);
           if (sizeJump && !sameBigTitle) brk = true;
           const short = prev.right < colRight - h * 2.5;
           if (short && endsSentence(prev.text) && !sameBigTitle) brk = true; // 짧은 마지막 줄
           // 짧은 한 줄 = 제목. 단, 본문보다 큰 글씨가 같은 크기로 이어지면 여러 줄 제목이라 나누지 않아요.
-          const bigTitleGoesOn = prev.fh > H * 1.15 && ln.fh > H * 1.15 && Math.abs(ln.fh - prev.fh) < prev.fh * 0.12 && titleFlows(prev);
+          const bigTitleGoesOn = prev.fh > BIG && ln.fh > BIG && Math.abs(ln.fh - prev.fh) < prev.fh * 0.12 && titleFlows(prev);
           // (소문자로 시작하는 줄은 앞 페이지에서 이어진 문장이라 제목이 아니에요)
           const headLike = /^[\p{Lu}\d"“‘'(]/u.test(prev.text);
           if (short && para.lines.length === 1 && !endsSentence(prev.text) && !bigTitleGoesOn && headLike) brk = true;
@@ -291,7 +435,7 @@ var TransYbCore = {
         if (isBullet(ln.firstText)) brk = true;
         // 큰 글씨 제목이 콜론이나 연결어로 끝나고 같은 크기로 이어지면, 줄 사이가 넓어도 같은 제목이에요.
         if (
-          prev.fh > H * 1.15 && ln.fh > H * 1.15 && Math.abs(ln.fh - prev.fh) < prev.fh * 0.12 &&
+          prev.fh > BIG && ln.fh > BIG && Math.abs(ln.fh - prev.fh) < prev.fh * 0.12 &&
           ln.top - prev.bottom < prev.fh * 1.6 &&
           /([:\-–—,&]|\b(of|and|the|in|for|on|to|with|a|an))\s*$/i.test(prev.text.trim())
         ) brk = false;
@@ -365,7 +509,7 @@ var TransYbCore = {
       // 페이지 맨 위나 맨 아래의 작은 글씨 = 머리말, 꼬리말, 내려받기 안내
       else if (atEdge && ph < H * 0.9 && t.length < 300 && !isBullet(t)) p.kind = "other";
       // 본문보다 큰 글씨의 짧은 문단 = 제목(두세 줄짜리 논문 제목 포함)
-      else if (ph > H * 1.15 && t.length < 300 && p.lines.length <= 4 && !endsFull(t) && !/[.!?]["”’)]*\s+[\p{Lu}"“‘(]/u.test(t)) p.kind = "heading";
+      else if (ph > BIG && t.length < 300 && p.lines.length <= 4 && !endsFull(t) && !/[.!?]["”’)]*\s+[\p{Lu}"“‘(]/u.test(t)) p.kind = "heading";
       // 본문과 다른 글꼴(굵은 글꼴 등)의 짧은 문단, 번호로 시작하는 짧은 문단(3.1 ...) = 소제목
       else if (
         (otherFont || numbered) && t.length < 250 && p.lines.length <= 3 && !endsFull(t) && !isBullet(t) &&
@@ -400,6 +544,50 @@ var TransYbCore = {
    * PDF 가 알려 주는 줄 폭이 실제 화면보다 훨씬 짧아요. 문단 중간 줄은 오른쪽 끝까지 찬다는 점으로 보정해요.
    * items: [{str, t:[a,b,c,d,e,f], w, h}], view: [x0, y0, x1, y1]
    */
+  /**
+   * 스캔한 책을 옆으로 눕혀 넣은 PDF(페이지 회전 90·180·270도)는 글자가 PDF 좌표에서 세로로 놓여 있어요.
+   * 글자 방향을 보고 화면에 보이는 대로 바로 선 좌표로 바꿔요.
+   * 돌려준 toPdf 는 바로 선 좌표 -> PDF 좌표, up 은 PDF 좌표 -> 바로 선 좌표 변환표예요.
+   */
+  uprightItems(items, view) {
+    const mul = (m, n) => [
+      m[0] * n[0] + m[2] * n[1], m[1] * n[0] + m[3] * n[1],
+      m[0] * n[2] + m[2] * n[3], m[1] * n[2] + m[3] * n[3],
+      m[0] * n[4] + m[2] * n[5] + m[4], m[1] * n[4] + m[3] * n[5] + m[5],
+    ];
+    // 글자 수로 가중한 가장 흔한 글자 방향(0, 90, 180, 270도)
+    const votes = [0, 0, 0, 0];
+    for (const it of items) {
+      const ang = Math.atan2(it.t[1], it.t[0]);
+      votes[(Math.round(ang / (Math.PI / 2)) + 4) % 4] += it.str.length;
+    }
+    const q = votes.indexOf(Math.max(...votes));
+    if (!q) return { items, view, up: null, toPdf: null };
+    const [x0, y0, x1, y1] = view;
+    const W = x1 - x0;
+    const H = y1 - y0;
+    const sh = [1, 0, 0, 1, -x0, -y0];
+    // q=1: 글자가 위로(90도) 놓임, q=2: 거꾸로, q=3: 아래로
+    const rot = [null, [0, -1, 1, 0, 0, W], [-1, 0, 0, -1, W, H], [0, 1, -1, 0, H, 0]][q];
+    const up = mul(rot, sh);
+    const back = [null, [0, 1, -1, 0, W, 0], [-1, 0, 0, -1, W, H], [0, -1, 1, 0, 0, H]][q];
+    const toPdf = mul([1, 0, 0, 1, x0, y0], back);
+    const out = items.map((it) => ({ ...it, t: mul(up, it.t) }));
+    const nv = q === 2 ? [0, 0, W, H] : [0, 0, H, W];
+    return { items: out, view: nv, up, toPdf };
+  },
+
+  // 변환표 m 으로 사각형 [x1, y1, x2, y2] 를 옮기고, 옮긴 네 꼭짓점을 감싸는 사각형을 돌려줘요.
+  mapRect(m, r) {
+    const xs = [];
+    const ys = [];
+    for (const [x, y] of [[r[0], r[1]], [r[2], r[1]], [r[0], r[3]], [r[2], r[3]]]) {
+      xs.push(m[0] * x + m[2] * y + m[4]);
+      ys.push(m[1] * x + m[3] * y + m[5]);
+    }
+    return [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
+  },
+
   fixSqueezedWidths(items, view) {
     const ratios = items.filter((it) => it.str.trim().length > 5 && it.t[3]).map((it) => Math.abs(it.t[0] / it.t[3]));
     if (ratios.length < 5) return items;
@@ -1107,6 +1295,12 @@ var TransYb = {
       `and translate only the title, followed by the original title in parentheses. ` +
       `Page numbers, running headers, and footers ("other"): copy unchanged. ` +
       `Notes (footnotes or endnotes): translate fully, and keep the note number at the very start followed by a space (e.g. "14 우리는 …"). ` +
+      `Page breaks: a sentence that is cut by a page break is given to you already joined into one complete item ` +
+      `(its end comes from the next page). Translate it as one complete, grammatical sentence; never leave it unfinished ` +
+      `and never translate only the part before the break. ` +
+      `The first paragraph of this page may continue the previous page's last paragraph: translate it as a continuation ` +
+      `(keep the same referents and terms, do not start as if a new topic). ` +
+      `Use the next-page context only to understand how the last paragraph continues. ` +
       `Return exactly one translation per item, in order; never merge, split, or skip items. ` +
       `Also return "headings": the numbers of the items that are real titles or section headings in context ` +
       `(the paper title, including on a cover page, and section or subsection titles). An item labeled "heading" above is only a guess from the layout: ` +
@@ -1116,6 +1310,7 @@ var TransYb = {
     const parts = [];
     if (ctx?.title) parts.push(`Paper title: ${ctx.title}`);
     if (ctx?.prev) parts.push(`Context from the previous page, last paragraph (do not translate):\n${ctx.prev}`);
+    if (ctx?.next) parts.push(`Context from the next page, first paragraph (do not translate):\n${ctx.next}`);
     const label = { body: "body paragraph", heading: "heading", ref: "reference entry", note: "note (footnote or endnote)", other: "page number / header / footer" };
     const lines = [];
     let lastPara = null;
@@ -1675,10 +1870,12 @@ var TransYb = {
       const t = Array.from(it.transform || [1, 0, 0, 1, 0, 0]).map(Number);
       items.push({ str: String(str), t, w: Number(it.width) || 0, h: Number(it.height) || Math.hypot(t[2], t[3]) || 10, font: String(it.fontName || "") });
     }
-    const view = Array.from(rp.view || [0, 0, 612, 792]).map(Number);
+    // 옆으로 눕혀 스캔한 페이지면 글자를 화면에 보이는 방향으로 바로 세워요.
+    const upr = TransYbCore.uprightItems(items, Array.from(rp.view || [0, 0, 612, 792]).map(Number));
+    const view = upr.view;
     // 스캔 PDF 의 OCR 글자 폭이 눌려 있으면 실제 화면 폭으로 보정해요.
-    const fixed = TransYbCore.fixSqueezedWidths(items, view);
-    return { items: fixed, pageHeight: view[3] - view[1], pageBottom: view[1] };
+    const fixed = TransYbCore.fixSqueezedWidths(upr.items, view);
+    return { items: fixed, pageHeight: view[3] - view[1], pageBottom: view[1], up: upr.up, toPdf: upr.toPdf };
   },
 
   // 문단 나누기만 한 결과(배우기 전). 옆 페이지와 비교할 때도 써요.
@@ -1686,9 +1883,9 @@ var TransYb = {
     this.raws = this.raws || new Map();
     const key = reader.itemID + ":" + pageIndex;
     if (this.raws.has(key)) return this.raws.get(key);
-    const { items, pageHeight, pageBottom } = await this.pageItems(reader, pageIndex);
+    const { items, pageHeight, pageBottom, up, toPdf } = await this.pageItems(reader, pageIndex);
     const pieces = items.map((it) => ({ raw: it.str, x: it.t[4], y: -it.t[5] - it.h, w: it.w, h: it.h, font: it.font }));
-    const raw = { L: TransYbCore.buildLayout(pieces), items, pageHeight, pageBottom };
+    const raw = { L: TransYbCore.buildLayout(pieces), items, pageHeight, pageBottom, up, toPdf };
     this.raws.set(key, raw);
     return raw;
   },
@@ -1781,12 +1978,15 @@ var TransYb = {
       items: raw.items,
       pageHeight: raw.pageHeight,
       pageBottom: raw.pageBottom,
+      up: raw.up,
+      toPdf: raw.toPdf,
     };
     // 페이지를 넘는 문장: 앞 쪽 마지막 문장이 안 끝났으면 이 쪽 첫 문장은 그 뒷부분(contPrev),
     // 이 쪽 마지막 문장이 안 끝났으면 다음 쪽 첫 부분까지 합쳐서 번역해요(joinNext).
     const endsS = (t) => /[.!?]["'”’)\]]*[\d¹²³⁰-⁹*†‡]{0,3}$/.test(String(t).trim());
-    // 문장이 다음 쪽으로 이어지는지: 앞이 소문자·쉼표·하이픈으로 끝나거나, 뒤가 소문자로 시작할 때만
-    const flows = (a, b) => !endsS(a) && (/[\p{Ll},;:\-–—]$/u.test(String(a).trim()) || /^[\p{Ll}(]/u.test(String(b).trim()));
+    // 문장이 다음 쪽으로 이어지는지: 본문 문장이 마침표 없이 쪽 끝에서 끊겼으면 이어진 거예요.
+    // (뒤 쪽 첫 글자가 대문자 이름이나 숫자여도 이어져요. 예: "...began in" / "Seoul in 1995")
+    const flows = (a, b) => !endsS(a) && !!String(b || "").trim() && !/^[•◦▪●‣]/.test(String(b).trim());
     const units = built.sentences;
     const firstIdx = units.findIndex((u) => u.kind !== "other");
     let lastIdx = -1;
@@ -1866,7 +2066,7 @@ var TransYb = {
       return null;
     }
     // 쪽을 넘는 문장이 있는 쪽인데, 문장 합치기(xpage)를 넣기 전에 번역한 것이면 새로 번역해요(잘린 문장으로 번역돼 있어서)
-    if (!saved.xpage && built.sentences.some((u) => u.joinNext || u.contPrev)) return null;
+    if ((saved.xpage || 0) < 2 && built.sentences.some((u) => u.joinNext || u.contPrev)) return null;
     const page = { ...built, lines: saved.lines, headings: saved.headings || null, bylines: saved.bylines || null, engine: saved.engine, lang: null, target };
     if (!this.cache.has(itemID)) this.cache.set(itemID, new Map());
     this.cache.get(itemID).set(pageIndex, page);
@@ -1923,8 +2123,14 @@ var TransYb = {
       }
       const rec = await this.diskFor(itemID);
       const old = rec.pages[pageIndex];
+      // 이 쪽을 새로 번역했으니, 칠해 둔 표시는 원문 주석을 기준으로 새 번역문에서 위치를 다시 찾아요.
+      const marks = rec.underlines?.[pageIndex];
+      if (marks?.length) {
+        for (const m of marks) m.relocate = true;
+        this._repairedPages?.delete(itemID + ":" + pageIndex);
+      }
       const byTarget = old?.text === built.text ? { ...(old.byTarget || (old.target ? { [old.target]: old } : {})) } : {};
-      byTarget[target] = { engine: page.engine, lines: page.lines, headings: page.headings, bylines: page.bylines, xpage: 1 };
+      byTarget[target] = { engine: page.engine, lines: page.lines, headings: page.headings, bylines: page.bylines, xpage: 2 };
       rec.pages[pageIndex] = { text: built.text, byTarget };
       this.saveDisk(itemID);
       if (!this.cache.has(itemID)) this.cache.set(itemID, new Map());
@@ -1955,6 +2161,14 @@ var TransYb = {
         const prev = await this.buildPage(reader, built.pageIndex - 1);
         const lastBody = [...prev.paras].reverse().find((p) => p.kind === "body");
         if (lastBody) ctx.prev = TransYbCore.unitSource(prev.text, lastBody, prev.soft);
+      } catch (e) {}
+    }
+    if (built.sentences.some((u) => u.joinNext)) {
+      try {
+        // 다음 쪽 첫 본문 문단(이 쪽 마지막 문장이 그리로 이어져요)
+        const next = await this.buildPage(reader, built.pageIndex + 1);
+        const firstBody = next.paras.find((p) => p.kind === "body");
+        if (firstBody) ctx.next = TransYbCore.unitSource(next.text, firstBody, next.soft);
       } catch (e) {}
     }
     const units = built.sentences;
@@ -2185,7 +2399,8 @@ var TransYb = {
     const unit = range || page.sentences[uIdx];
     const rects = this.rangeRects(page, unit);
     if (!rects.length) return null;
-    const top = Math.max(0, Math.round(page.pageHeight + page.pageBottom - Math.max(...rects.map((r) => r[3]))));
+    const upRects = page.toPdf ? this.rangeRects(page, unit, true) : rects;
+    const top = Math.max(0, Math.round(page.pageHeight + page.pageBottom - Math.max(...upRects.map((r) => r[3]))));
     const pad = (n, k) => String(n).padStart(k, "0");
     const json = {
       key: Zotero.DataObjectUtilities.generateKey(),
@@ -2273,6 +2488,29 @@ var TransYb = {
   },
 
   // 원문(영어)에서 사용자가 새로 형광펜/밑줄을 칠하면, 번역문의 같은 부분에도 칠해요.
+  async marksFromAnnotation(page, ann, origin) {
+    const span = TransYbCore.findAnnotationSpan(page.text, ann.annotationText || "");
+    if (!span) return [];
+    const out = [];
+    for (let u = 0; u < page.sentences.length; u++) {
+      const un = page.sentences[u];
+      const s0 = Math.max(span[0], un.start);
+      const e0 = Math.min(span[1], un.end);
+      if (e0 <= s0 || un.kind === "other") continue;
+      const ko = page.lines[u] || "";
+      const coversAll = s0 - un.start <= 2 && un.end - e0 <= 2;
+      let range = [0, ko.length];
+      if (!coversAll) {
+        const part = TransYbCore.unitSource(page.text, { start: s0, end: e0 }, page.soft);
+        range = (await this.alignToTarget(page, u, part).catch(() => null)) || [0, ko.length];
+      }
+      const rec = { u, from: range[0], to: range[1], type: ann.annotationType, color: ann.annotationColor, ann: ann.key, whole: coversAll };
+      if (origin) rec.origin = origin;
+      out.push(rec);
+    }
+    return out;
+  },
+
   async onAnnotationsAdded(ids) {
     for (const id of ids) {
       const ann = Zotero.Items.get(id);
@@ -2312,7 +2550,7 @@ var TransYb = {
           const part = TransYbCore.unitSource(page.text, { start: s0, end: e0 }, page.soft);
           range = (await this.alignToTarget(page, u, part).catch(() => null)) || [0, ko.length];
         }
-        list.push({ u, from: range[0], to: range[1], type: ann.annotationType, color: ann.annotationColor, ann: ann.key, whole: coversAll });
+        list.push({ u, from: range[0], to: range[1], type: ann.annotationType, color: ann.annotationColor, ann: ann.key, whole: coversAll, origin: "pdf" });
         changed = true;
       }
       if (changed) {
@@ -2349,11 +2587,15 @@ var TransYb = {
       try {
         let range = null;
         if (!whole) range = await this.alignToSource(page, rec.u, rec.from, rec.to);
-        if (whole || !range) {
+        if (whole) {
           // 문장 전체: 같은 문장, 같은 종류, 같은 색의 원문 주석이 있으면 같이 써요
           rec.ann = list.find((x) => x !== rec && x.u === rec.u && x.type === rec.type && x.color === rec.color && x.ann && x.whole)?.ann || null;
           if (!rec.ann) rec.ann = await this.createMarkAnnotation(page, rec.u, rec.type, rec.color);
           rec.whole = true;
+        } else if (!range) {
+          // 같은 부분을 못 찾았어요(예: 사용 한도). 우선 문장 전체에 칠해 두고, 다음에 이 쪽을 열 때 다시 찾아 일부분으로 바꿔요.
+          rec.ann = await this.createMarkAnnotation(page, rec.u, rec.type, rec.color);
+          rec.pending = true;
         } else {
           rec.ann = await this.createMarkAnnotation(page, rec.u, rec.type, rec.color, range);
         }
@@ -2362,6 +2604,101 @@ var TransYb = {
       }
     }
     this.saveDisk(page.itemID);
+  },
+
+  /**
+   * 번역문에서 일부만 칠했는데 원문에는 문장 전체가 칠해진 표시를 찾아, 원문도 같은 부분만 칠하도록 바꿔요.
+   * (예전 버전에서 만든 표시, 사용 한도 때문에 대응을 못 찾았던 표시)
+   * 원문에서 직접 칠한 주석(origin: "pdf")은 건드리지 않아요.
+   */
+  async repairMarks(page) {
+    this._repairedPages = this._repairedPages || new Set();
+    const key = page.itemID + ":" + page.pageIndex;
+    if (this._repairedPages.has(key)) return;
+    this._repairedPages.add(key);
+    const att = Zotero.Items.get(page.itemID);
+    if (!att) return;
+    const list = this.underlinesFor(page.itemID, page.pageIndex);
+    const hints = await this.markHints();
+    let changed = false;
+    // (가) 다시 번역한 쪽: 원문 주석 글자로 문장을 찾고, 그 부분에 맞는 새 번역문 위치를 찾아요.
+    const moving = list.filter((x) => x.relocate);
+    for (const annKey of new Set(moving.map((x) => x.ann))) {
+      const olds = moving.filter((x) => x.ann === annKey);
+      const ann = annKey && Zotero.Items.getByLibraryAndKey(att.libraryID, annKey);
+      const fresh = ann ? await this.marksFromAnnotation(page, ann, olds[0].origin) : [];
+      for (const o of olds) list.splice(list.indexOf(o), 1);
+      if (!fresh.length) {
+        this.fileLog(`relocate p${page.pageIndex + 1}: ${annKey} not found, mark dropped from translation`);
+        changed = true;
+        continue;
+      }
+      for (const f of fresh) {
+        if (olds[0].origin !== "pdf") f.partialOk = true;
+        list.push(f);
+      }
+      changed = true;
+    }
+    for (const rec of list.slice()) {
+      if (!rec.ann || rec.origin === "pdf" || rec.partialOk) continue;
+      const ko = page.lines[rec.u] || "";
+      const unit = page.sentences[rec.u];
+      if (!ko || !unit || rec.to <= rec.from || rec.to > ko.length + 1) continue; // 번역이 바뀌어 위치가 맞지 않는 기록
+      if ((rec.to - rec.from) / ko.trim().length >= 0.9) continue; // 거의 문장 전체
+      const ann = Zotero.Items.getByLibraryAndKey(att.libraryID, rec.ann);
+      if (!ann) continue;
+      const src = TransYbCore.looseKey(TransYbCore.unitSource(page.text, unit, page.soft));
+      const annText = TransYbCore.looseKey(ann.annotationText || "");
+      const coversAll = rec.pending || annText.length >= src.length * 0.9;
+      if (!coversAll) {
+        rec.partialOk = true;
+        changed = true;
+        continue;
+      }
+      let range = null;
+      const hint = hints[rec.ann + "|" + rec.u + "|" + rec.from + "|" + rec.to];
+      if (hint) {
+        const r = TransYbCore.findInUnit(page.text, unit, page.soft, hint);
+        if (r) range = { start: r[0], end: r[1], text: hint };
+        this.fileLog(`repair hint: "${hint.slice(0, 30)}" ${r ? "found" : "not found"}`);
+      }
+      if (!range) {
+        try {
+          range = await this.alignToSource(page, rec.u, rec.from, rec.to);
+        } catch (e) {
+          this.fileLog("repair align failed: " + this.errText(e));
+        }
+      }
+      if (!range) continue; // 다음에 다시 해요
+      const newKey = await this.createMarkAnnotation(page, rec.u, rec.type, rec.color, range);
+      if (!newKey) continue;
+      const old = rec.ann;
+      rec.ann = newKey;
+      delete rec.whole;
+      delete rec.pending;
+      rec.partialOk = true;
+      changed = true;
+      if (!list.some((x) => x.ann === old)) {
+        this.ownAnn.add(old); // 지우는 것도 "원문에서 지움"으로 다시 받지 않아요
+        await this.deleteAnnotation(page.itemID, old);
+      }
+      this.fileLog(`repaired mark p${page.pageIndex + 1} u${rec.u}: ${old} -> ${newKey}`);
+    }
+    if (changed) this.saveDisk(page.itemID);
+    return changed;
+  },
+
+  // 미리 맞춰 둔 대응표(~/Zotero/trans_yb/mark-hints.json). 없으면 빈 표.
+  async markHints() {
+    if (this._markHints) return this._markHints;
+    this._markHints = {};
+    try {
+      const path = Zotero.DataDirectory.dir + "/trans_yb/mark-hints.json";
+      this._markHints = JSON.parse(await Zotero.File.getContentsAsync(path)) || {};
+    } catch (e) {
+      // 파일이 없으면 그냥 넘어가요
+    }
+    return this._markHints;
   },
 
   async removeMarks(page, pieces) {
@@ -2404,8 +2741,9 @@ var TransYb = {
   },
 
   // 페이지 글자 범위 {start, end} 가 차지하는 사각형들(PDF 좌표)
-  rangeRects(page, unit) {
+  rangeRects(page, unit, upright = false) {
     if (!unit) return [];
+    if (page.toPdf && !upright) return this.rangeRects(page, unit, true).map((r) => TransYbCore.mapRect(page.toPdf, r).map((n) => Math.round(n * 1000) / 1000));
     const rects = [];
     for (const p of TransYbCore.piecesForSentence(page.ranges, unit)) {
       const it = page.items[p.piece];
@@ -2503,8 +2841,12 @@ var TransYb = {
       const [a, b, c, d, e, f] = pvp.m;
       const det = a * d - b * c;
       if (!det) return null;
-      const X = (d * (px - e) - c * (py - f)) / det;
-      const Y = (-b * (px - e) + a * (py - f)) / det;
+      let X = (d * (px - e) - c * (py - f)) / det;
+      let Y = (-b * (px - e) + a * (py - f)) / det;
+      if (page.up) {
+        const u = page.up;
+        [X, Y] = [u[0] * X + u[2] * Y + u[4], u[1] * X + u[3] * Y + u[5]];
+      }
       for (let i = 0; i < page.items.length; i++) {
         const it = page.items[i];
         const x1 = it.t[4];
@@ -2717,7 +3059,16 @@ var TransYb = {
         box-shadow: 0 1px 3px rgba(0,0,0,.12), 0 0 0 .5px rgba(0,0,0,.04); }
       .tyb-root { position: relative; }
       .tyb-list { display: flex; flex-direction: column; gap: 18px; padding: 2px 2px 8px;
-        -moz-user-select: text; user-select: text; cursor: text; }
+        -moz-user-select: text; user-select: text; cursor: text;
+        position: relative; }
+      .tyb-listwrap { position: relative; }
+      /* "다음 쪽" 단추: 번역 칸 바로 아래 오른쪽에 고정. 번역 칸을 스크롤해도 같은 자리이고 글자를 가리지 않아요 */
+      .tyb-nextrow { position: fixed; z-index: 20; display: flex; gap: 6px; justify-content: flex-end; pointer-events: none; }
+      .tyb-next { pointer-events: auto; -moz-appearance: none; appearance: none; height: 22px; padding: 0 10px;
+        border-radius: 11px; border: .5px solid var(--tyb-sep); cursor: pointer; background: var(--tyb-card);
+        color: var(--tyb-label); font: inherit; font-size: .82em; font-weight: 500;
+        -moz-user-select: none; user-select: none; }
+      .tyb-next:hover { color: var(--tyb-text); }
       .tyb-selbar { position: absolute; z-index: 10; display: flex; align-items: center; gap: 8px; padding: 4px 6px;
         border-radius: 9px;
         background: light-dark(rgba(255,255,255,.96), rgba(44,44,46,.96)); border: .5px solid var(--tyb-sep);
@@ -3055,6 +3406,18 @@ var TransYb = {
     metaEl.style.display = "none";
     const list = h("div");
     list.className = "tyb-list";
+    // 번역 맨 끝 오른쪽에 붙는 작은 "다음 쪽" 단추(글자를 가리지 않게 번역 아래 줄에 놓아요)
+    const nextBtn = h("button", null, "다음 쪽 ›");
+    nextBtn.className = "tyb-next";
+    const prevBtn = h("button", null, "‹ 이전 쪽");
+    prevBtn.className = "tyb-next";
+    const nextRow = h("div");
+    nextRow.className = "tyb-nextrow";
+    nextRow.style.display = "none";
+    nextRow.append(prevBtn, nextBtn);
+    const listWrap = h("div");
+    listWrap.className = "tyb-listwrap";
+    listWrap.append(list, nextRow);
     // 번역문을 드래그하면 뜨는 작은 단추 (밑줄 / 밑줄 지우기)
     const selBar = h("div");
     selBar.className = "tyb-selbar";
@@ -3103,7 +3466,7 @@ var TransYb = {
     noteSrc.className = "tyb-note-src";
     notePop.append(noteHead, noteBody, noteSrc);
     noteClose.addEventListener("click", () => (notePop.style.display = "none"));
-    wrap.append(bar, styleBox.root, settings.root, pre.root, status, metaEl, list, selBar, notePop);
+    wrap.append(bar, styleBox.root, settings.root, pre.root, status, metaEl, listWrap, selBar, notePop);
     body.appendChild(wrap);
 
     const self = this;
@@ -3211,7 +3574,7 @@ var TransYb = {
         if (tr && this.itemID === reader.itemID) draw(tr);
       },
 
-      // 다른 논문으로 바뀌면 이어 붙인 목록을 비워요.
+      // 다른 논문으로 바뀌면 목록을 비워요.
       ensureItem(itemID) {
         if (this.blocksItem === itemID) return;
         list.textContent = "";
@@ -3305,20 +3668,43 @@ var TransYb = {
         const block = this.buildBlock(page);
         const old = this.blocks.get(page.pageIndex);
         if (old) old.el.replaceWith(block.el);
-        else {
-          const after = [...this.blocks.keys()].filter((k) => k > page.pageIndex).sort((a, b) => a - b)[0];
-          if (after !== undefined) list.insertBefore(block.el, this.blocks.get(after).el);
-          else list.appendChild(block.el);
-        }
+        else list.insertBefore(block.el, list.firstChild);
         this.blocks.set(page.pageIndex, block);
-        if (page.pageIndex === this.pageIndex) {
-          this.shown = page;
-          this.showStatus(page);
-        }
-        Promise.resolve().then(() => this.applyTextStyle(null, null));
+        // 다른 쪽으로 넘어갔으면 번역 맨 위부터 보여 줘요.
+        if (this.scrollPage !== page.itemID + ":" + page.pageIndex) list.scrollTop = 0;
+        this.scrollPage = page.itemID + ":" + page.pageIndex;
+        this.shown = page;
+        this.showStatus(page);
+        Promise.resolve().then(() => {
+          this.applyTextStyle(null, null);
+          this.fitScroll();
+        });
+      },
+
+      // 번역 상자: 화면 아래 끝까지. 상자 안에서 직접 스크롤해 글을 올려 읽고, 끝까지 내리면 PDF가 함께 내려가요.
+      fitScroll() {
+        const win = doc.defaultView;
+        if (!win || !list.isConnected) return;
+        const top = list.getBoundingClientRect().top;
+        // 번역은 칸 안 스크롤 없이 끝까지 쭉 보여요(오른쪽 칸 전체가 스크롤돼요).
+        list.style.maxHeight = "";
+        list.style.paddingBottom = "34px"; // 번역 끝 줄이 "다음 쪽" 단추에 가리지 않게
+        const lr = list.getBoundingClientRect();
+        nextRow.style.right = Math.max(4, Math.round(win.innerWidth - lr.right)) + "px";
+        // 오른쪽 칸 아래 끝에 늘 떠 있어요(아래 정보 칸까지 스크롤해도 같은 자리).
+        nextRow.style.top = Math.round(win.innerHeight - 30) + "px";
+        const visible = list.offsetParent !== null;
+        nextRow.style.display = visible && this.blocks.get(this.pageIndex) ? "" : "none";
       },
 
       buildBlock(page) {
+        // 표시를 고쳤으면(위치를 다시 찾았으면) 한 번 더 그려요. 같은 쪽은 한 번만 고쳐서 되풀이되지 않아요.
+        if (page.lines) {
+          self
+            .repairMarks(page)
+            .then((changed) => changed && !this.destroyed && this.renderList(page))
+            .catch((e) => self.fileLog("repair failed: " + self.errText(e)));
+        }
         const el = h("div");
         el.className = "tyb-pageblock";
 
@@ -3615,6 +4001,7 @@ var TransYb = {
 
       // 페이지가 바뀌었는지 1초마다 확인해요.
       tick() {
+        this.fitScroll(); // 설정 칸을 열고 닫으면 높이가 바뀌어요
         const reader = this.reader();
         const v = reader && self.viewer(reader);
         if (!v) return;
@@ -3644,6 +4031,54 @@ var TransYb = {
       pane.renderQueue();
     });
     list.addEventListener("mouseup", () => doc.defaultView.setTimeout(() => pane.onSelect(), 0));
+    // 번역 상자를 끝까지 내린 뒤에도 계속 내리면, 그만큼 PDF가 내려가요(다음 쪽으로 넘어가면 그 쪽 번역이 떠요).
+    list.addEventListener(
+      "wheel",
+      (e) => {
+        if (e.deltaY <= 0) return;
+        // 오른쪽 칸 전체가 아직 더 내려갈 수 있으면 그대로 둬요. 끝까지 내려간 뒤에만 PDF가 내려가요.
+        let sc = list.parentNode;
+        while (sc && sc.nodeType === 1) {
+          const oy = doc.defaultView.getComputedStyle(sc).overflowY;
+          if ((oy === "auto" || oy === "scroll") && sc.scrollHeight > sc.clientHeight + 1) break;
+          sc = sc.parentNode;
+        }
+        if (sc && sc.nodeType === 1 && sc.scrollTop + sc.clientHeight < sc.scrollHeight - 2) return;
+        const reader = pane.reader();
+        const v = reader && self.viewer(reader);
+        if (!v) return;
+        const px = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaMode === 2 ? e.deltaY * list.clientHeight : e.deltaY;
+        v.pdfViewer.container.scrollTop += px;
+        e.preventDefault();
+      },
+      { passive: false }
+    );
+    prevBtn.addEventListener("click", () => {
+      const reader = pane.reader();
+      const v = reader && self.viewer(reader);
+      if (v && pane.pageIndex > 0) v.pdfViewer.currentPageNumber = pane.pageIndex;
+    });
+    nextBtn.addEventListener("click", () => {
+      const reader = pane.reader();
+      const v = reader && self.viewer(reader);
+      if (!v) return;
+      const n = Number(v.pdfViewer.pagesCount) || Infinity;
+      if (pane.pageIndex + 1 < n) v.pdfViewer.currentPageNumber = pane.pageIndex + 2;
+    });
+    doc.defaultView.addEventListener("resize", () => !pane.destroyed && pane.fitScroll());
+    // 오른쪽 칸 전체를 스크롤하면 "다음 쪽" 단추 자리도 바로 따라가요.
+    let pframe = 0;
+    doc.addEventListener(
+      "scroll",
+      () => {
+        if (pframe || pane.destroyed) return;
+        pframe = doc.defaultView.requestAnimationFrame(() => {
+          pframe = 0;
+          pane.fitScroll();
+        });
+      },
+      { capture: true, passive: true }
+    );
     wrap.addEventListener("mousedown", (e) => {
       if (notePop.style.display !== "none" && !notePop.contains(e.target)) notePop.style.display = "none";
     });

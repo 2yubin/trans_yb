@@ -104,4 +104,43 @@ t("논문 끝 미주와 페이지 아래 각주의 내용을 찾아요", () => {
   assert.strictEqual(notes.get("1"), "This is a page footnote that continues on the next line.");
 });
 
+t("대문자 H가 소문자로 깨진 PDF도 문장을 나눠요", () => {
+  const raw = "This is the New Parent (Baker 2008; hollis-Lane and Tate 1994). household care takes shape (hale 2003). however, it is fluid, e.g. parents who live apart.";
+  const fixed = Core.repairBrokenCaps(raw);
+  assert.strictEqual(fixed.length, raw.length);
+  assert.ok(fixed.includes("(Baker 2008; Hollis-Lane") && fixed.includes(". Household") && fixed.includes("(Hale 2003)") && fixed.includes(". However,"));
+  assert.ok(fixed.includes("e.g. parents"));
+  assert.strictEqual(Core.splitSentences(fixed).length, 3);
+  // 보통 글(줄임말 뒤 소문자)은 그대로
+  const ok = "We use surveys, e.g. polls. and so on? et al. found it.";
+  assert.strictEqual(Core.repairBrokenCaps(ok), ok);
+});
+
+t("옆으로 눕혀 스캔한 페이지(90도)를 바로 세우고 다시 PDF 좌표로 되돌려요", () => {
+  const items = [];
+  for (let k = 0; k < 10; k++) items.push({ str: "word" + k, t: [0, 10, -10, 0, 300, 100 + k * 40], w: 30, h: 10 });
+  const u = Core.uprightItems(items, [0, 0, 728, 1031]);
+  assert.deepStrictEqual(u.view, [0, 0, 1031, 728]);
+  assert.deepStrictEqual(u.items[0].t.slice(0, 4), [10, 0, 0, 10]);
+  // 글자가 왼쪽에서 오른쪽으로 놓여요
+  assert.ok(u.items[1].t[4] > u.items[0].t[4]);
+  const back = Core.mapRect(u.toPdf, [u.items[0].t[4], u.items[0].t[5], u.items[0].t[4] + 1, u.items[0].t[5] + 1]);
+  assert.ok(Math.abs(back[0] - 299) < 1.01 && Math.abs(back[1] - 100) < 1.01);
+  // 보통 페이지는 그대로
+  assert.strictEqual(Core.uprightItems([{ str: "abc", t: [10, 0, 0, 10, 5, 5], w: 9, h: 10 }], [0, 0, 612, 792]).up, null);
+});
+
+t("펼친 책 두 쪽(왼쪽·오른쪽)을 따로 읽어요", () => {
+  const P = [];
+  for (let r = 0; r < 12; r++) {
+    P.push({ raw: "left line number " + r + " of the page goes on here", x: 50, y: 100 + r * 14, w: 250, h: 11 });
+    P.push({ raw: "right line number " + r + " of the page goes on here", x: 400, y: 100 + r * 14, w: 250, h: 11 });
+  }
+  const L = Core.buildLayout(P);
+  const li = L.text.indexOf("left line number 11");
+  const ri = L.text.indexOf("right line number 0");
+  assert.ok(li >= 0 && ri > li, "왼쪽 쪽을 다 읽고 오른쪽 쪽을 읽어요");
+  assert.ok(L.ranges.every((r) => r));
+});
+
 console.log(`\n${pass}개 시험 모두 통과`);
