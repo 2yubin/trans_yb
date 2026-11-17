@@ -132,6 +132,8 @@ var TransYbCore = {
    */
   REF_HEADING: /^(references|bibliography|works cited|literature|required readings|recommended readings|readings|참고\s*문헌|litteratur(liste)?|referencer|referencias|bibliograf[ií]a)\b/i,
   BULLET: /^([•◦▪●‣∙·–—-]|\(?\d{1,2}[.)])\s/,
+  // 저작권, DOI, 내려받기 안내처럼 번역할 필요 없는 줄
+  BOILER_LINE: /^(©|\(c\)\s*\d{4}|copyright\b|doi\s*:|https?:\/\/doi\.org|issn\b|e-?issn\b|downloaded from\b|this content downloaded)/i,
 
   buildLayout(piecesIn) {
     // 0) 큰 첫 글자(E|nglish): 크기와 위치를 다음 조각에 맞춰 같은 줄의 한 단어로 붙여요.
@@ -287,6 +289,14 @@ var TransYbCore = {
         const pFirst = para && para.lines[0];
         if (pFirst && (isBullet(pFirst.firstText) || /\b(1[6-9]|20)\d{2}[a-z]?\b/.test(pFirst.text)) && ln.left > pFirst.left + Math.max(H, 1) * 0.5 && !isBullet(ln.firstText) && Math.abs(ln.fh - prev.fh) < prev.fh * 0.25 && ln.top - prev.bottom <= normalGap + Math.max(H, 1) * 0.5) brk = false;
         if (isBullet(ln.firstText)) brk = true;
+        // 큰 글씨 제목이 콜론이나 연결어로 끝나고 같은 크기로 이어지면, 줄 사이가 넓어도 같은 제목이에요.
+        if (
+          prev.fh > H * 1.15 && ln.fh > H * 1.15 && Math.abs(ln.fh - prev.fh) < prev.fh * 0.12 &&
+          ln.top - prev.bottom < prev.fh * 1.6 &&
+          /([:\-–—,&]|\b(of|and|the|in|for|on|to|with|a|an))\s*$/i.test(prev.text.trim())
+        ) brk = false;
+        // 저작권(©), DOI 같은 안내 줄은 앞뒤 줄과 항상 따로예요
+        if (TransYbCore.BOILER_LINE.test(ln.text) || TransYbCore.BOILER_LINE.test(prev.text)) brk = true;
       }
       if (brk) startPara();
       else {
@@ -351,6 +361,7 @@ var TransYbCore = {
       }
       if (/^\d{1,4}$/.test(tt) || tt.length <= 2) p.kind = "other";
       else if (/This content downloaded from|All use subject to|about\.jstor\.org\/terms|^\d{1,3}(\.\d{1,3}){3} on \w{3}, \d/i.test(t)) p.kind = "other";
+      else if (TransYbCore.BOILER_LINE.test(tt) && tt.length < 200) p.kind = "other";
       // 페이지 맨 위나 맨 아래의 작은 글씨 = 머리말, 꼬리말, 내려받기 안내
       else if (atEdge && ph < H * 0.9 && t.length < 300 && !isBullet(t)) p.kind = "other";
       // 본문보다 큰 글씨의 짧은 문단 = 제목(두세 줄짜리 논문 제목 포함)
@@ -2730,7 +2741,7 @@ var TransYb = {
       .tyb-pagehead > b { font-weight: 500; font-variant-numeric: tabular-nums; }
       .tyb-meta { display: flex; flex-direction: column; gap: 4px; padding: 12px 2px 14px; border-bottom: .5px solid var(--tyb-sep); }
       .tyb-meta-kind { font-size: .75em; letter-spacing: .08em; color: var(--tyb-label); }
-      .tyb-meta-title { font-weight: 700; line-height: 1.5; margin-bottom: 2px; }
+      .tyb-meta-title { font-weight: 700; font-size: 1.18em; line-height: 1.45; margin-bottom: 4px; }
       .tyb-meta-orig { font-size: .85em; color: var(--tyb-label); line-height: 1.4; }
       .tyb-meta-authors { font-weight: 600; margin-top: 4px; }
       .tyb-meta-line { font-size: .85em; color: var(--tyb-label); }

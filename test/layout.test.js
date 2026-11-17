@@ -186,4 +186,17 @@ t("굵은 글꼴 소제목은 본문과 나누고, 짧은 저자·소속 줄은 
   ]);
 });
 
+t("저작권 줄은 제목과 떼어 빼고, 콜론으로 끝나는 큰 제목은 줄 사이가 넓어도 한 덩어리예요", () => {
+  const Q = [];
+  Q.push({ raw: "© 2015 by The Author(s)", x: 54, y: 400, w: 110, h: 9, font: "f3" }); // 실제 PDF처럼 페이지 아래쪽
+  Q.push({ raw: "Raising Quiet sons:", x: 206, y: 96, w: 172, h: 16, font: "f2" });
+  Q.push({ raw: "Everyday american fatherhood and south Korea's Parent school", x: 54, y: 132, w: 324, h: 16, font: "f2" });
+  Q.push({ raw: "How do fathers far from home take up new ideas of care? We examine this question here.", x: 54, y: 180, w: 324, h: 9, font: "f3" });
+  Q.push({ raw: "The study draws on interviews in two towns and shows how men adapt to it.", x: 54, y: 191, w: 300, h: 9, font: "f3" });
+  const R = Core.buildLayout(Q);
+  const got = R.paras.map((p) => p.kind + ": " + R.text.slice(p.start, p.end));
+  assert.ok(got.includes("other: © 2015 by The Author(s)"), JSON.stringify(got));
+  assert.ok(got.includes("heading: Raising Quiet sons: Everyday american fatherhood and south Korea's Parent school"), JSON.stringify(got));
+});
+
 console.log(`\n${pass}개 시험 모두 통과`);
