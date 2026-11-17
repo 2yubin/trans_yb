@@ -1,0 +1,19 @@
+{
+  "manifest_version": 2,
+  "name": "trans_yb",
+  "version": "0.15.1",
+  "description": "PDF 한 페이지를 문장 단위로 번역해 옆에 띄우고, 커서를 대면 원문과 번역 문장을 함께 강조합니다.",
+  "author": "2yubin",
+  "icons": {
+    "48": "content/icon20-v3.svg",
+    "96": "content/icon20-v3.svg"
+  },
+  "applications": {
+    "zotero": {
+      "id": "trans_yb@local.plugin",
+      "update_url": "https://localhost/trans_yb-no-updates.json",
+      "strict_min_version": "10.0",
+      "strict_max_version": "10.*"
+    }
+  }
+}
