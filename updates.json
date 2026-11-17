@@ -1,0 +1,18 @@
+{
+  "addons": {
+    "trans_yb@local.plugin": {
+      "updates": [
+        {
+          "version": "0.16.1",
+          "update_link": "https://github.com/2yubin/trans_yb/releases/download/v0.16.1/trans_yb.xpi",
+          "update_hash": "sha256:81ef54dd19a8fbbf33783d09fc0d8edd9b17eb4fcbfe6dd0f46517cc4dd70e67",
+          "applications": {
+            "zotero": {
+              "strict_min_version": "10.0"
+            }
+          }
+        }
+      ]
+    }
+  }
+}
