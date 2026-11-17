@@ -1865,6 +1865,8 @@ var TransYb = {
     if (!saved || entry.text !== built.text || saved.lines?.length !== built.sentences.length) {
       return null;
     }
+    // 쪽을 넘는 문장이 있는 쪽인데, 문장 합치기(xpage)를 넣기 전에 번역한 것이면 새로 번역해요(잘린 문장으로 번역돼 있어서)
+    if (!saved.xpage && built.sentences.some((u) => u.joinNext || u.contPrev)) return null;
     const page = { ...built, lines: saved.lines, headings: saved.headings || null, bylines: saved.bylines || null, engine: saved.engine, lang: null, target };
     if (!this.cache.has(itemID)) this.cache.set(itemID, new Map());
     this.cache.get(itemID).set(pageIndex, page);
@@ -1922,7 +1924,7 @@ var TransYb = {
       const rec = await this.diskFor(itemID);
       const old = rec.pages[pageIndex];
       const byTarget = old?.text === built.text ? { ...(old.byTarget || (old.target ? { [old.target]: old } : {})) } : {};
-      byTarget[target] = { engine: page.engine, lines: page.lines, headings: page.headings, bylines: page.bylines };
+      byTarget[target] = { engine: page.engine, lines: page.lines, headings: page.headings, bylines: page.bylines, xpage: 1 };
       rec.pages[pageIndex] = { text: built.text, byTarget };
       this.saveDisk(itemID);
       if (!this.cache.has(itemID)) this.cache.set(itemID, new Map());
@@ -2735,7 +2737,6 @@ var TransYb = {
       .tyb-prog > div { height: 100%; width: 0; background: var(--tyb-label); transition: width .3s ease; }
       .tyb-para { line-height: 1.6; }
       .tyb-pageblock { display: flex; flex-direction: column; gap: 10px; }
-      .tyb-cont { color: var(--tyb-label); }
       .tyb-pagehead { display: flex; align-items: center; gap: 8px; color: var(--tyb-label); font-size: .78em; margin-top: 4px; }
       .tyb-pagehead > span { flex: 1; height: 0; border-top: .5px solid var(--tyb-sep); }
       .tyb-pagehead > b { font-weight: 500; font-variant-numeric: tabular-nums; }
@@ -3334,9 +3335,10 @@ var TransYb = {
         let lastPara = null;
         page.sentences.forEach((u, i) => {
           const line = page.lines[i] || "";
-          // 앞 쪽에서 이어진 뒷부분: 번역은 앞 쪽 마지막 문장에 합쳐져 있어요. 그 번역을 연한 회색으로 보여 줘요.
+          // 앞 쪽에서 이어진 뒷부분: 번역은 앞 쪽 마지막 문장에 합쳐져 있어요.
+          // 그 완성된 문장 번역을 이 쪽 첫 문단의 첫 문장으로 보통 글씨로 넣어요.
+          let cont = null;
           if (u.contPrev && !line) {
-            rows.push(null);
             const prev = self.cache.get(page.itemID)?.get(page.pageIndex - 1);
             const hi = prev ? prev.sentences.findIndex((x) => x.joinNext) : -1;
             const prevLine = hi >= 0 ? prev.lines[hi] : "";
@@ -3346,19 +3348,11 @@ var TransYb = {
               const reader = this.reader();
               if (reader) self.loadSaved(reader, page.pageIndex - 1).then((pg) => pg && this.renderList(page)).catch(() => {});
             }
-            if (prevLine) {
-              const cont = h("div", null, prevLine);
-              cont.className = "tyb-para tyb-cont";
-              cont.title = "앞 쪽에서 이어진 문장";
-              cont.addEventListener("mouseenter", () => {
-                const reader = this.reader();
-                const v = reader && self.viewer(reader);
-                if (v) self.highlightPdfSentence(v, page.pageIndex - 1, prev, hi);
-              });
-              el.appendChild(cont);
-              textEls.push(cont);
+            if (!prevLine) {
+              rows.push(null);
+              return;
             }
-            return;
+            cont = { prev, hi, text: prevLine };
           }
           if (u.para !== lastPara) {
             lastPara = u.para;
@@ -3389,6 +3383,19 @@ var TransYb = {
           }
           const span = h("span");
           span.className = "tyb-unit";
+          if (cont) {
+            // 앞 쪽에서 이어진 문장(보통 글씨). 커서를 대면 앞 쪽과 이 쪽의 원문이 함께 표시돼요.
+            span.textContent = cont.text;
+            span.title = "앞 쪽에서 이어진 문장";
+            span.addEventListener("mouseenter", () => {
+              const reader = this.reader();
+              const v = reader && self.viewer(reader);
+              if (v) self.highlightPdfSentence(v, page.pageIndex - 1, cont.prev, cont.hi);
+            });
+            paraEl.appendChild(span);
+            rows.push(null);
+            return;
+          }
           const fn = TransYbCore.footnoteSpans(line, fnSets[i]);
           // 주석 번호는 앞의 작은 표시로 보여 줬으니 글 안에서는 빼요(글자 위치가 바뀌지 않게 표시 길이만 줄여요)
           const noteNum = u.kind === "note" ? /^\s*(\d{1,3}|[*†‡])\s*/.exec(line) : null;
