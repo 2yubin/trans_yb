@@ -3671,7 +3671,15 @@ var TransYb = {
         else list.insertBefore(block.el, list.firstChild);
         this.blocks.set(page.pageIndex, block);
         // 다른 쪽으로 넘어갔으면 번역 맨 위부터 보여 줘요.
-        if (this.scrollPage !== page.itemID + ":" + page.pageIndex) list.scrollTop = 0;
+        if (this.scrollPage !== page.itemID + ":" + page.pageIndex) {
+          // 쪽이 바뀌면 오른쪽 칸을 새 번역의 맨 위로 올려요(다시 스크롤하지 않아도 되게).
+          doc.defaultView.requestAnimationFrame(() => {
+            const sc = this.scroller();
+            if (!sc) return;
+            const d = list.getBoundingClientRect().top - sc.getBoundingClientRect().top - 8;
+            if (d < 0 || d > sc.clientHeight * 0.5) sc.scrollTop += d;
+          });
+        }
         this.scrollPage = page.itemID + ":" + page.pageIndex;
         this.shown = page;
         this.showStatus(page);
@@ -3679,6 +3687,17 @@ var TransYb = {
           this.applyTextStyle(null, null);
           this.fitScroll();
         });
+      },
+
+      // 오른쪽 칸 전체를 스크롤하는 바깥 상자
+      scroller() {
+        let sc = list.parentNode;
+        while (sc && sc.nodeType === 1) {
+          const oy = doc.defaultView.getComputedStyle(sc).overflowY;
+          if ((oy === "auto" || oy === "scroll") && sc.scrollHeight > sc.clientHeight + 1) return sc;
+          sc = sc.parentNode;
+        }
+        return null;
       },
 
       // 번역 상자: 화면 아래 끝까지. 상자 안에서 직접 스크롤해 글을 올려 읽고, 끝까지 내리면 PDF가 함께 내려가요.
@@ -4031,28 +4050,50 @@ var TransYb = {
       pane.renderQueue();
     });
     list.addEventListener("mouseup", () => doc.defaultView.setTimeout(() => pane.onSelect(), 0));
-    // 번역 상자를 끝까지 내린 뒤에도 계속 내리면, 그만큼 PDF가 내려가요(다음 쪽으로 넘어가면 그 쪽 번역이 떠요).
-    list.addEventListener(
-      "wheel",
-      (e) => {
-        if (e.deltaY <= 0) return;
-        // 오른쪽 칸 전체가 아직 더 내려갈 수 있으면 그대로 둬요. 끝까지 내려간 뒤에만 PDF가 내려가요.
-        let sc = list.parentNode;
-        while (sc && sc.nodeType === 1) {
-          const oy = doc.defaultView.getComputedStyle(sc).overflowY;
-          if ((oy === "auto" || oy === "scroll") && sc.scrollHeight > sc.clientHeight + 1) break;
-          sc = sc.parentNode;
+    // 번역 끝이 화면에 보인 뒤에도 조금 더 내리면(문라이트처럼) 다음 쪽으로 넘어가요.
+    // 넘어가면 오른쪽 칸이 새 번역의 맨 위로 올라가요. 트랙패드 관성으로 여러 쪽이 한꺼번에 넘어가지 않게,
+    // 한 번 넘긴 뒤에는 손을 잠깐 멈출 때까지 기다려요.
+    let over = 0;
+    let lastWheel = 0;
+    let locked = false;
+    const onWheel = (e) => {
+      const now = Date.now();
+      const quiet = now - lastWheel > 250;
+      lastWheel = now;
+      if (locked) {
+        if (!quiet) {
+          e.preventDefault();
+          return;
         }
-        if (sc && sc.nodeType === 1 && sc.scrollTop + sc.clientHeight < sc.scrollHeight - 2) return;
-        const reader = pane.reader();
-        const v = reader && self.viewer(reader);
-        if (!v) return;
-        const px = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaMode === 2 ? e.deltaY * list.clientHeight : e.deltaY;
-        v.pdfViewer.container.scrollTop += px;
-        e.preventDefault();
-      },
-      { passive: false }
-    );
+        locked = false;
+      }
+      if (e.deltaY <= 0) {
+        over = 0;
+        return;
+      }
+      const sc = pane.scroller();
+      const end = list.getBoundingClientRect().bottom;
+      const viewBottom = sc ? sc.getBoundingClientRect().bottom : doc.defaultView.innerHeight;
+      if (end > viewBottom + 2) {
+        over = 0; // 아직 번역이 더 남았어요
+        return;
+      }
+      const reader = pane.reader();
+      const v = reader && self.viewer(reader);
+      if (!v || !pane.blocks.get(pane.pageIndex)) return;
+      e.preventDefault();
+      over += e.deltaMode === 1 ? e.deltaY * 16 : e.deltaMode === 2 ? e.deltaY * 400 : e.deltaY;
+      if (over < 140) return; // 살짝 더 내렸을 때만
+      over = 0;
+      locked = true;
+      const n = Number(v.pdfViewer.pagesCount) || Infinity;
+      if (pane.pageIndex + 1 < n) {
+        v.pdfViewer.currentPageNumber = pane.pageIndex + 2;
+        doc.defaultView.setTimeout(() => !pane.destroyed && pane.tick(), 30);
+      }
+    };
+    list.addEventListener("wheel", onWheel, { passive: false });
+    nextRow.addEventListener("wheel", onWheel, { passive: false });
     prevBtn.addEventListener("click", () => {
       const reader = pane.reader();
       const v = reader && self.viewer(reader);
