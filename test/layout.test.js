@@ -199,4 +199,36 @@ t("저작권 줄은 제목과 떼어 빼고, 콜론으로 끝나는 큰 제목�
   assert.ok(got.includes("heading: Raising Quiet sons: Everyday american fatherhood and south Korea's Parent school"), JSON.stringify(got));
 });
 
+t("첫 쪽: 맨 위 제목이 두 단을 가로질러도 아래는 두 단으로 읽고, 단을 넘어가는 문장은 이어요", () => {
+  const Q = [];
+  Q.push({ raw: "A Long Paper Title That Runs Across Both Columns", x: 50, y: 20, w: 450, h: 17, font: "f3" });
+  Q.push({ raw: "Some Author, Some Book: A Subtitle That Also Runs Across. Northfield: Press.", x: 50, y: 45, w: 440, h: 12, font: "f3" });
+  const lw = 238;
+  const left = [
+    "Abstract This paper asks a question that matters a", "great deal to many readers. Its account of several",
+    "young people and their troubles has raised new", "questions about how researchers write about others.",
+    "It would be nice to write a review of this book on", "its own terms. But that is no longer possible. The",
+    "book has been caught up in many debates. Its claims", "were widely praised in the press, but some readers",
+    "were far less impressed. Such debates are not new.", "One famous study, for example, was condemned for",
+    "failing to obtain consent from the",
+  ];
+  const right = [
+    "men he studied, and for not protecting them well.", "The debate split apart a department at the time.",
+    "Another classic study is widely seen as a model of", "fieldwork and a foundation of the method itself.",
+    "Decades later, a critic published a review of it.", "She said the author had made things up in places.",
+    "Recent cases have raised similar questions about", "memory, reliability, and honesty in the field.",
+    "Each of these cases drew wide public attention.", "Each also left lasting marks on how people work.",
+    "The present book now joins this long, odd list.",
+  ];
+  left.forEach((r, i) => Q.push({ raw: r, x: 50, y: 90 + i * 12.5, w: lw, h: 10, font: "f1" }));
+  right.forEach((r, i) => Q.push({ raw: r, x: 306, y: 90 + i * 12.5, w: lw, h: 10, font: "f1" }));
+  const R = Core.buildLayout(Q);
+  const got = R.paras.map((p) => p.kind + ": " + R.text.slice(p.start, p.end));
+  assert.strictEqual(got[0], "heading: A Long Paper Title That Runs Across Both Columns");
+  // 문단 첫 줄을 소제목으로 끊지 않아요
+  assert.ok(got.some((g) => g.startsWith("body: Abstract This paper asks a question that matters a great deal")), JSON.stringify(got));
+  // 왼쪽 단 끝 "consent from the" 와 오른쪽 단 첫 줄 "men he studied" 가 한 문단이에요
+  assert.ok(got.some((g) => g.includes("consent from the men he studied")), JSON.stringify(got));
+});
+
 console.log(`\n${pass}개 시험 모두 통과`);

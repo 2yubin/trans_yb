@@ -133,7 +133,8 @@ var TransYbCore = {
   REF_HEADING: /^(references|bibliography|works cited|literature|required readings|recommended readings|readings|참고\s*문헌|litteratur(liste)?|referencer|referencias|bibliograf[ií]a)\b/i,
   BULLET: /^([•◦▪●‣∙·–—-]|\(?\d{1,2}[.)])\s/,
   // 저작권, DOI, 내려받기 안내처럼 번역할 필요 없는 줄
-  BOILER_LINE: /^(©|\(c\)\s*\d{4}|copyright\b|doi\s*:|https?:\/\/doi\.org|issn\b|e-?issn\b|downloaded from\b|this content downloaded)/i,
+  // "# Springer … 2016": 기호 글꼴의 ©를 PDF가 #으로 기록한 경우. "DOI 10.…": 콜론 없는 DOI 줄
+  BOILER_LINE: /^(©|#\s+\p{Lu}.*\b(19|20)\d{2}$|\(c\)\s*\d{4}|copyright\b|doi\s*:|doi\s+10\.|https?:\/\/doi\.org|issn\b|e-?issn\b|downloaded from\b|this content downloaded)/iu,
 
   /**
    * 한 장에 두 단(또는 펼친 책 두 쪽)이 나란히 있으면, 가운데의 빈 세로 띠를 찾아 왼쪽·오른쪽으로 나눠요.
@@ -142,15 +143,60 @@ var TransYbCore = {
   splitColumns(pieces) {
     const ps = pieces.map((p, i) => ({ ...p, i })).filter((p) => String(p.raw).trim() && p.w > 0);
     if (ps.length < 20) return null;
-    const minX = Math.min(...ps.map((p) => p.x));
-    const maxX = Math.max(...ps.map((p) => p.x + p.w));
-    const span = maxX - minX;
     const hs = ps.map((p) => p.h || 10).sort((a, b) => a - b);
     const H = hs[Math.floor(hs.length / 2)];
-    const N = Math.ceil(span);
+    // 페이지 전체가 두 단이면 바로 나눠요
+    let found = TransYbCore._splitAt(ps, H);
+    let head = [];
+    let tail = [];
+    if (!found) {
+      // 논문 첫 쪽처럼 맨 위(제목, 서지)나 맨 아래에 두 단을 가로지르는 줄이 몇 줄 있으면,
+      // 그 줄들을 떼어 내고 나머지만으로 두 단을 나눠요. 가로지르는 줄이 적은 쪽을 골라요.
+      const rows = [];
+      for (const p of ps.slice().sort((a, b) => a.y - b.y)) {
+        const r = rows[rows.length - 1];
+        if (r && p.y - r.y < H * 0.5) r.ps.push(p);
+        else rows.push({ y: p.y, ps: [p] });
+      }
+      const maxCut = Math.min(15, Math.floor(rows.length * 0.4));
+      let best = null;
+      for (let k = 0; k <= maxCut; k++) {
+        for (let j = 0; j <= maxCut - k; j++) {
+          if (k + j === 0 || (best && k + j >= best.k + best.j)) continue;
+          const mid = rows.slice(k, rows.length - j).flatMap((r) => r.ps);
+          const f = TransYbCore._splitAt(mid, H);
+          if (f) best = { k, j, f };
+        }
+      }
+      if (!best) return null;
+      found = best.f;
+      head = rows.slice(0, best.k).flatMap((r) => r.ps);
+      tail = rows.slice(rows.length - best.j).flatMap((r) => r.ps);
+    }
+    const sideOf = new Map();
+    for (const p of head) sideOf.set(p.i, 0);
+    for (const p of found.left) sideOf.set(p.i, 1);
+    for (const p of found.right) sideOf.set(p.i, 2);
+    for (const p of tail) sideOf.set(p.i, 3);
+    const groups = [[], [], [], []];
+    let last = 0;
+    pieces.forEach((p, i) => {
+      // 빈 조각은 바로 앞 글자 조각과 같은 쪽에 둬요
+      const side = sideOf.has(i) ? sideOf.get(i) : last;
+      groups[side].push(i);
+      last = side;
+    });
+    return groups.filter((g) => g.length);
+  },
+
+  // 조각들 사이 가운데(30%~70%)에 넓은 빈 띠가 있고, 양쪽에 글줄이 충분하면 {left, right}
+  _splitAt(ps, H) {
+    if (ps.length < 20) return null;
+    const minX = Math.min(...ps.map((p) => p.x));
+    const maxX = Math.max(...ps.map((p) => p.x + p.w));
+    const N = Math.ceil(maxX - minX);
     const cover = new Uint8Array(N + 1);
     for (const p of ps) for (let x = Math.floor(p.x - minX); x < Math.ceil(p.x + p.w - minX) && x <= N; x++) cover[x] = 1;
-    // 가운데(30%~70%)에서 가장 넓은 빈 띠
     let best = null;
     let runStart = -1;
     for (let x = Math.floor(N * 0.3); x <= Math.ceil(N * 0.7) + 1; x++) {
@@ -170,15 +216,7 @@ var TransYbCore = {
     // 양쪽 모두 글줄이 여러 개 있어야 진짜 두 단이에요
     if (lineCount(left) < 4 || lineCount(right) < 4) return null;
     if (Math.min(chars(left), chars(right)) < chars(ps) * 0.1) return null;
-    const leftSet = new Set(left.map((p) => p.i));
-    const L = [];
-    const R = [];
-    pieces.forEach((p, i) => {
-      // 빈 조각은 바로 앞 글자 조각과 같은 쪽에 둬요
-      const side = String(p.raw).trim() && p.w > 0 ? leftSet.has(i) : (L.length && L[L.length - 1] === i - 1);
-      (side ? L : R).push(i);
-    });
-    return [L, R];
+    return { left, right };
   },
 
   /**
@@ -217,24 +255,61 @@ var TransYbCore = {
     const piecesIn = TransYbCore.deskew(piecesRaw);
     const cols = TransYbCore.splitColumns(piecesIn);
     if (!cols) return TransYbCore.buildLayoutOne(piecesIn);
-    // 왼쪽 단을 다 읽고 오른쪽 단을 읽어요. 위치 정보는 원래 조각 번호로 되돌려요.
+    // 위쪽 가로 줄 -> 왼쪽 단 -> 오른쪽 단 -> 아래쪽 가로 줄 순서로 읽어요. 위치 정보는 원래 조각 번호로 되돌려요.
+    const blocks = []; // { one, idxs, pa, join }  join = 앞 문단에 이어 붙음
+    let notesOpen = false;
+    // 쪽 전체 본문 글씨 크기: 글자 수로 가중한 조각 높이의 중앙값
+    const hs = [];
+    for (const p of piecesIn) { const n = Math.min(String(p.raw).trim().length, 40); for (let k = 0; k < n; k++) hs.push(p.h || 10); }
+    hs.sort((a, b) => a - b);
+    const pageH = hs.length ? hs[Math.floor(hs.length / 2)] : 0;
+    const endsS = (t) => /[.!?:;。？！]["'”’)\]]*[¹²³⁰-⁹\d*†‡]{0,3}$/.test(t.trim());
+    for (const idxs of cols) {
+      const one = TransYbCore.buildLayoutOne(idxs.map((i) => piecesIn[i]), pageH);
+      if (!one.text) continue;
+      const mine = one.paras.map((pa) => ({ one, idxs, pa }));
+      // 단을 넘어가는 문장: 앞 단의 마지막 본문 문단이 문장 중간에서 끝났고(뒤에는 각주·쪽 번호만 있음),
+      // 이 단의 첫 문단이 본문이면 이어 붙여요. 사이에 낀 각주는 이어 붙인 문단 뒤로 보내요.
+      const first = mine[0];
+      if (first && first.pa.kind === "body") {
+        let k = blocks.length - 1;
+        while (k >= 0 && (blocks[k].pa.kind === "note" || blocks[k].pa.kind === "other")) k--;
+        const host = k >= 0 ? blocks[k] : null;
+        const hostText = host && host.one.text.slice(host.pa.start, host.pa.end);
+        const firstText = first.one.text.slice(first.pa.start, first.pa.end);
+        if (host && host.pa.kind === "body" && !endsS(hostText) && /^[\p{Ll}\d(“"‘']/u.test(firstText) && host.idxs !== first.idxs) {
+          first.join = true;
+          first.hy = /[\p{L}]-$/u.test(hostText);
+          blocks.splice(k + 1, 0, mine.shift());
+        }
+      }
+      blocks.push(...mine);
+      notesOpen = one.notesOpen;
+    }
     const ranges = piecesIn.map(() => null);
     let text = "";
     const soft = [];
     const paras = [];
-    let notesOpen = false;
-    for (const idxs of cols) {
-      const one = TransYbCore.buildLayoutOne(idxs.map((i) => piecesIn[i]));
-      if (!one.text) continue;
-      if (text) text += "\n";
-      const off = text.length;
-      text += one.text;
+    for (const bl of blocks) {
+      const { one, idxs, pa } = bl;
+      let off;
+      if (bl.join && paras.length) {
+        const last = paras[paras.length - 1];
+        if (bl.hy) soft.push(text.length - 1);
+        else text += " ";
+        off = text.length - pa.start;
+        text += one.text.slice(pa.start, pa.end);
+        last.end = text.length;
+      } else {
+        if (text) text += "\n";
+        off = text.length - pa.start;
+        text += one.text.slice(pa.start, pa.end);
+        paras.push({ ...pa, start: pa.start + off, end: pa.end + off });
+      }
       one.ranges.forEach((r, k) => {
-        if (r) ranges[idxs[k]] = { ...r, start: r.start + off, end: r.end + off };
+        if (r && r.start >= pa.start && r.end <= pa.end) ranges[idxs[k]] = { ...r, start: r.start + off, end: r.end + off };
       });
-      for (const x of one.soft) soft.push(x + off);
-      for (const pa of one.paras) paras.push({ ...pa, start: pa.start + off, end: pa.end + off });
-      notesOpen = one.notesOpen;
+      for (const x of one.soft) if (x >= pa.start && x < pa.end) soft.push(x + off);
     }
     return { text, ranges, soft, paras, notesOpen };
   },
@@ -269,7 +344,7 @@ var TransYbCore = {
     return chars.join("");
   },
 
-  buildLayoutOne(piecesIn) {
+  buildLayoutOne(piecesIn, baseH = 0) {
     // 0) 큰 첫 글자(E|nglish): 크기와 위치를 다음 조각에 맞춰 같은 줄의 한 단어로 붙여요.
     const pieces = piecesIn.map((p) => ({ ...p }));
     for (let i = 0; i < pieces.length - 1; i++) {
@@ -340,11 +415,13 @@ var TransYbCore = {
     // 여러 줄 제목이 이어지려면: 앞 줄이 단 폭의 60% 이상이거나 연결어로 끝나야 해요(짧은 저자 이름 줄은 따로).
     const titleFlows = (l) => l.right - l.left >= colWidth * 0.75 || /([:,\-–—&/]|\b(of|and|the|in|for|on|to|a|an|with|und|og|y|de)\b)\s*$/i.test(l.text);
     const lineHs = sorted(real.map((l) => l.fh));
-    const H = lineHs[Math.floor(lineHs.length / 2)];
+    // 단으로 나눈 경우에는 쪽 전체의 본문 글씨 크기를 기준으로 써요(위쪽 제목 줄만 떼어 낸 작은 덩어리도 제목을 알아보게)
+    const H = baseH || lineHs[Math.floor(lineHs.length / 2)];
     // 스캔 OCR 페이지는 줄마다 글자 높이가 들쭉날쭉해요. 흔들림이 크면 "큰 글씨(제목)" 기준을 그만큼 높여요.
     // 흔들림 = 줄 높이가 가운데 값에서 벗어난 정도의 중앙값(보통 PDF는 거의 0)
     const devs = sorted(real.map((l) => Math.abs(l.fh - H) / Math.max(H, 1)));
-    const noise = devs[Math.floor(devs.length / 2)];
+    // 줄이 적은 덩어리(첫 쪽 맨 위 제목·서지 줄만 떼어 낸 것 등)는 크기가 원래 제각각이라 흔들림으로 보지 않아요.
+    const noise = real.length >= 10 ? devs[Math.floor(devs.length / 2)] : 0;
     const BIG = H * Math.min(1.5, 1.15 + Math.max(0, noise - 0.03) * 2.5);
     const gaps = [];
     for (let i = 1; i < real.length; i++) {
@@ -410,6 +487,8 @@ var TransYbCore = {
           if (refLike && para.lines.length > 1 && ln.left < prev.left - h * 0.8 && Math.abs(ln.left - first.left) < h * 0.8) brk = true;
         } else if (endsSentence(prev.text) && prev.right < colRight - h * 2.5) {
           brk = true;
+        } else if (noise < 0.03 && Math.abs(ln.fh - prev.fh) > Math.max(ln.fh, prev.fh) * 0.2) {
+          brk = true; // 위로 올라가면서 글자 크기도 바뀜 = 다른 덩어리(맨 위 머리말 등)
         }
         // 문장이 분명히 이어지면 나누지 않아요:
         // 앞 줄이 문장 중간에서 끝났고, 줄 사이가 벌어지지 않았고, 앞 줄이 머리말(전부 대문자)이 아니며,
@@ -423,6 +502,9 @@ var TransYbCore = {
         const continues =
           sameFont &&
           prevLong &&
+          // 큰 글씨 제목 다음의 보통 글씨 줄은 이어진 문장이 아니에요(스캔 글자 높이의 작은 흔들림은 빼고)
+          // (다음 줄이 소문자로 시작하면 크기가 달라도 이어진 문장이에요. 예: 큰 첫 글자가 있는 첫 줄)
+          !((prev.fh > BIG || ln.fh > BIG) && Math.abs(ln.fh - prev.fh) > Math.max(ln.fh, prev.fh) * 0.2 && !/^[\p{Ll}(]/u.test(ln.text)) &&
           !endsSentence(prev.text) &&
           gap2 <= normalGap + Math.max(H, 1) * 0.6 &&
           !allCaps &&
