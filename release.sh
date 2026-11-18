@@ -8,7 +8,7 @@ cd "$(dirname "$0")"
 V=$(node -p 'require("./addon/manifest.json").version')
 if gh release view "v$V" >/dev/null 2>&1; then echo "v$V 는 이미 올렸어요. manifest.json 의 version 을 올려 주세요."; exit 1; fi
 # GitHub 웹에서 고친 것(README 등)이 있으면 먼저 받아 와요
-git pull --rebase origin main
+git pull --rebase --autostash origin main
 sh build.sh
 HASH=$(shasum -a 256 build/trans_yb.xpi | cut -d' ' -f1)
 node -e '
