@@ -8,6 +8,7 @@ pref("extensions.trans_yb.fontPx", 0);         // 번역 글씨 크기(px), 0 = 
 pref("extensions.trans_yb.textColor", "");      // 빈 값 = 기본 글씨 색
 pref("extensions.trans_yb.styleOpen", false);    // 글씨 설정 펼침 상태
 pref("extensions.trans_yb.engineOpen", false);   // 번역 엔진 설정 펼침 상태
+pref("extensions.trans_yb.askOpen", true);         // "AI에게 묻기" 칸을 처음에 펼쳐 둬요
 pref("extensions.trans_yb.claudeCodePath", "");  // 비우면 자동으로 찾아요
 pref("extensions.trans_yb.prefetchOpen", false);  // 미리 번역 펼침 상태
 pref("extensions.trans_yb.markType", "highlight"); // 번역문 표시 종류: highlight(형광펜) 또는 underline(밑줄)
