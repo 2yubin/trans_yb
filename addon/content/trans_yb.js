@@ -825,6 +825,17 @@ var TransYbCore = {
           !/[.!?;。？！]["'”’)\]]*$/.test(prev.text.trim()) && !/^\d{1,4}$/.test(prev.text.trim()) &&
           !TransYbCore.BOILER_LINE.test(ln.text) && !TransYbCore.BOILER_LINE.test(prev.text)
         ) brk = false;
+        // 본문 크기여도 본문과 다른 글꼴(기울임, 굵은 글꼴)의 소제목이 연결어나 콜론으로 끝나고
+        // 같은 글꼴, 같은 크기로 촘촘하게 이어지면 한 소제목이에요
+        // (예: "Substantive Significance for" / "Attendings").
+        if (
+          para && para.lines.length <= 2 &&
+          ln.font && prev.font && ln.font === prev.font && bodyFont && prev.font !== bodyFont &&
+          Math.abs(ln.fh - prev.fh) < prev.fh * 0.08 &&
+          ln.top - prev.bottom < prev.fh * 0.6 && ln.top >= prev.top &&
+          /([:\-–—,&]|\b(of|and|the|in|for|on|to|with|a|an|from|by|at|between|versus|vs\.?))\s*$/i.test(prev.text.trim()) &&
+          !endsSentence(prev.text)
+        ) brk = false;
         // 저작권(©), DOI 같은 안내 줄은 앞뒤 줄과 항상 따로예요
         if (TransYbCore.BOILER_LINE.test(ln.text) || TransYbCore.BOILER_LINE.test(prev.text)) brk = true;
       }
@@ -1918,6 +1929,10 @@ var TransYb = {
       const r = await this.codexTranslate(sentences, target, ctx);
       return { lines: r.lines, headings: r.headings, bylines: r.bylines, lang: null, engine: "Codex" };
     }
+    if (this.pref("engine") === "antigravity") {
+      const r = await this.agyTranslate(sentences, target, ctx);
+      return { lines: r.lines, headings: r.headings, bylines: r.bylines, lang: null, engine: "Antigravity" };
+    }
     if (this.pref("engine") === "claude") {
       const r = await this.claudeTranslate(sentences, target, ctx);
       return { lines: r.lines, headings: r.headings, bylines: r.bylines, lang: null, engine: "Claude" };
@@ -2272,6 +2287,15 @@ var TransYb = {
         return null;
       }
     }
+    if (engine === "antigravity") {
+      try {
+        const d = await this.runAgy(system, user, schema);
+        return d.structured_output || JSON.parse(d.response);
+      } catch (e) {
+        this.fileLog("askJSON agy failed: " + this.errText(e));
+        return null;
+      }
+    }
     if (engine === "claude") {
       const key = String(this.pref("anthropicKey") || "").trim();
       if (!key) return null;
@@ -2368,6 +2392,119 @@ var TransYb = {
       } catch (e) {}
     }
     return null;
+  },
+
+  // ---------- Antigravity CLI (agy): Google 계정(무료, AI Pro, Ultra)으로 Gemini 를 써요 ----------
+  // 2026-06-18부터 개인 Google 계정의 Gemini CLI 로그인은 Antigravity CLI 로 옮겨 갔어요.
+  // 공식 설치 위치: macOS/Linux ~/.local/bin/agy, Windows %LOCALAPPDATA%\agy\bin
+  findAntigravity() {
+    const custom = String(this.pref("agyPath") || "").trim();
+    const home = Services.dirsvc.get("Home", Ci.nsIFile).path;
+    const candidates = [];
+    if (custom) candidates.push(custom);
+    candidates.push(home + "/.local/bin/agy", "/opt/homebrew/bin/agy", "/usr/local/bin/agy");
+    if (Services.appinfo.OS === "WINNT") {
+      candidates.push(home + "\\AppData\\Local\\agy\\bin\\agy.exe", home + "\\AppData\\Local\\agy\\bin\\agy.cmd");
+    }
+    for (const c of candidates) {
+      try {
+        const f = Zotero.File.pathToFile(c);
+        if (f.exists() && f.isExecutable()) return c;
+      } catch (e) {}
+    }
+    return null;
+  },
+
+  // agy 를 한 번 실행하고 JSON 결과를 돌려줘요. 실패하면 사용자에게 보일 오류를 던져요.
+  // agy 에는 시스템 프롬프트 옵션이 없어서 지시문을 질문 앞에 붙여요.
+  // 빈 작업 폴더에서 실행해서, 에이전트가 다른 파일을 읽지 못하게 해요.
+  async runAgy(system, user, schema) {
+    const bin = this.findAntigravity();
+    if (!bin) throw this.userErr("이 컴퓨터에서 Antigravity CLI(agy)를 찾지 못했어요. 설치한 뒤 터미널에서 agy 를 한 번 실행해 Google 계정으로 로그인해 주세요.");
+    const work = Zotero.DataDirectory.dir + "/trans_yb/agy";
+    await Zotero.File.createDirectoryIfMissingAsync(work, { from: Zotero.DataDirectory.dir });
+    // 빈 값 인자는 Windows 에서 사라지므로 빈 값을 넘기지 않아요.
+    // 서버가 붐비면(HTTP 503) agy 가 계속 다시 시도하며 기다려요. 4분이 넘으면 멈춰요.
+    const args = [
+      "-p", system + "\n\nDo not use any tools. Answer directly from the text below.\n\n" + user,
+      "--output-format", "json", "--disable-slash-commands", "--print-timeout", "240s",
+    ];
+    if (schema) args.push("--json-schema", JSON.stringify(schema));
+    const model = String(this.pref("agyModel") || "").trim();
+    if (model) args.push("--model", model);
+    const { Subprocess } = ChromeUtils.importESModule("resource://gre/modules/Subprocess.sys.mjs");
+    const home = Services.dirsvc.get("Home", Ci.nsIFile).path;
+    let proc;
+    try {
+      proc = await Subprocess.call({
+        command: bin,
+        arguments: args,
+        workdir: work,
+        environment: { HOME: home, PATH: "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:" + home + "/.local/bin" },
+        environmentAppend: true,
+        stderr: "pipe",
+      });
+    } catch (e) {
+      this.fileLog("agy start failed: " + this.errText(e));
+      throw this.userErr("Antigravity CLI를 실행하지 못했어요.");
+    }
+    proc.stdin.close();
+    const readAll = async (pipe) => {
+      let out = "";
+      let chunk;
+      while ((chunk = await pipe.readString())) out += chunk;
+      return out;
+    };
+    const [stdout, stderr] = await Promise.all([readAll(proc.stdout), readAll(proc.stderr)]);
+    const { exitCode } = await proc.wait();
+    let data = null;
+    try {
+      data = JSON.parse(stdout);
+    } catch (e) {}
+    if (!data || data.status !== "SUCCESS" || exitCode !== 0) {
+      const detail = String((data && data.error) || stderr || stdout || "exit " + exitCode);
+      this.fileLog("agy error: " + detail.slice(0, 500));
+      if (/authenticat|log ?in|sign in|credential/i.test(detail)) {
+        throw this.userErr("Antigravity CLI에 로그인이 안 되어 있어요. 터미널에서 agy 를 한 번 실행해 Google 계정으로 로그인해 주세요.");
+      }
+      if (/capacity|unavailable|503|time ?out|timed out|deadline/i.test(detail)) {
+        throw this.userErr("Gemini 서버가 붐벼서 답을 받지 못했어요. 잠시 뒤 다시 누르거나, 설정 agyModel 에 gemini-3.8-flash-medium 같은 다른 모델을 넣어 보세요.");
+      }
+      if (/quota|limit|rate|exhausted|credits/i.test(detail)) {
+        throw this.userErr("Antigravity(Gemini) 사용 한도에 걸렸어요. 무료 계정은 한도가 매주 다시 채워져요. 잠시 뒤 다시 눌러 주세요.");
+      }
+      throw this.userErr("Antigravity 실행에 실패했어요: " + detail.slice(0, 120));
+    }
+    const u = data.usage || {};
+    this.fileLog(`agy ok: ${data.duration_seconds} s, in ${u.input_tokens || 0} / out ${u.output_tokens || 0} tokens`);
+    return data;
+  },
+
+  async agyTranslate(sentences, target, ctx) {
+    const { system, user } = this.claudePrompt(sentences, target, ctx);
+    const schema = {
+      type: "object",
+      properties: {
+        translations: { type: "array", items: { type: "string" } },
+        headings: { type: "array", items: { type: "integer" } },
+        bylines: { type: "array", items: { type: "integer" } },
+      },
+      required: ["translations", "headings", "bylines"],
+      additionalProperties: false,
+    };
+    const data = await this.runAgy(system, user, schema);
+    let out = data.structured_output;
+    if (!out || !Array.isArray(out.translations)) {
+      try {
+        out = JSON.parse(data.response);
+      } catch (e) {}
+    }
+    const list = out?.translations;
+    if (!Array.isArray(list) || list.length !== sentences.length) {
+      this.fileLog(`agy count mismatch: got ${list?.length} expected ${sentences.length}`);
+      throw this.userErr(`번역 문장 수가 맞지 않아요 (${list?.length ?? 0}/${sentences.length}). 다시 눌러 주세요.`);
+    }
+    return { lines: list.map((x) => String(x)), headings: this.cleanHeadings(out?.headings, list.length), bylines: this.cleanHeadings(out?.bylines, list.length) };
   },
 
   // Codex 를 "한 번 물어보고 끝내는" 방식(codex exec)으로 실행해요. 로그인된 ChatGPT 계정을 써요.
@@ -3236,6 +3373,8 @@ var TransYb = {
     if (!force && box[key] && box[key].caption === fig.caption) return box[key];
     const engine = this.pref("engine") || "claude-code";
     if (engine === "google") throw this.userErr("Google 엔진은 그림을 볼 수 없어요. 번역 엔진 설정에서 Claude Code, Codex, Claude API 중 하나를 골라 주세요.");
+    // agy 에 그림 파일을 화면 없이 넘기는 방법이 공식 문서에 없어서, 확인할 때까지 막아 둬요.
+    if (engine === "antigravity") throw this.userErr("Antigravity 엔진은 아직 표·그림 해석을 못 해요. 번역 엔진 설정에서 Claude Code, Codex, Claude API 중 하나를 골라 주세요.");
     let title = "";
     try {
       const att = Zotero.Items.get(reader.itemID);
@@ -4658,7 +4797,7 @@ var TransYb = {
     const seg = h("div");
     seg.className = "tyb-seg";
     segWrap.appendChild(seg);
-    const ENGINES = [["claude-code", "Claude Code"], ["codex", "Codex"], ["claude", "Claude API"], ["google", "Google"]];
+    const ENGINES = [["claude-code", "Claude Code"], ["codex", "Codex"], ["antigravity", "Gemini"], ["claude", "Claude API"], ["google", "Google"]];
     const segBtns = [];
     const keyBox = h("div");
     keyBox.className = "tyb-sub";

@@ -338,4 +338,30 @@ t("문단 나누기가 바뀌어도 옛 번역을 문장별로 옮겨 써요(나
   assert.ok(!Core.numbersAgree(["In 1990 we saw 45 cases.", "By 2001 there were 67.", "The 1985 law changed 12 rules.", "Since 1999, 88 more."], ["2001년에는 67건이었다.", "1985년 법은 12개 규칙을 바꿨다.", "1999년 이후 88건.", "1990년에 45건."]));
 });
 
+t("본문 크기의 기울임 소제목이 연결어로 끝나 두 줄로 나뉘면 한 소제목으로 읽어요", () => {
+  // Nelson 외(2023) 645쪽: "Substantive Significance for" / "Attendings" (같은 기울임 글꼴, 본문과 같은 크기)
+  const Q = [];
+  let y = 100;
+  const P = (x, text, w, font) => { Q.push({ raw: text, x, y, w, h: 12.5, font }); y += 12.5; };
+  const R = "Melior-Roman", I = "Melior-Italic";
+  for (let i = 0; i < 6; i++) P(51, "The body text of the results section keeps going with numbers and comparisons " + i, 240, R);
+  P(51, "(and median) woman, compared to 7 (2) for the mean man.", 200, R);
+  y += 10;
+  P(51, "Substantive Significance for ", 150, I);
+  P(51, "Attendings", 55, I);
+  y += 4;
+  for (let i = 0; i < 5; i++) P(51, "The difference in the amount and specificity of feedback is large for attendings " + i, 240, R);
+  P(51, "and it matters for promotion.", 120, R);
+  // 두 줄이 같은 글꼴이어도, 연결어로 끝나지 않는 소제목은 따로예요
+  y += 10;
+  P(51, "Data", 30, I);
+  P(51, "Measures", 50, I);
+  y += 4;
+  for (let i = 0; i < 5; i++) P(51, "We measure feedback with a set of coded variables drawn from the evaluation forms " + i, 240, R);
+  const L = Core.buildLayout(Q);
+  const heads = L.paras.filter((p) => p.kind === "heading").map((p) => L.text.slice(p.start, p.end).trim());
+  assert.ok(heads.includes("Substantive Significance for Attendings"), JSON.stringify(heads));
+  assert.ok(heads.includes("Data") && heads.includes("Measures"), JSON.stringify(heads));
+});
+
 console.log(`\n${pass}개 시험 모두 통과`);
