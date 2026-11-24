@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "trans_yb",
-  "version": "0.16.3",
+  "version": "0.17.1",
   "description": "PDF 한 페이지를 문장 단위로 번역해 옆에 띄우고, 커서를 대면 원문과 번역 문장을 함께 강조합니다.",
   "author": "2yubin",
   "icons": {

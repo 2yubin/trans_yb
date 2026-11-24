@@ -231,4 +231,111 @@ t("첫 쪽: 맨 위 제목이 두 단을 가로질러도 아래는 두 단으로
   assert.ok(got.some((g) => g.includes("consent from the men he studied")), JSON.stringify(got));
 });
 
+t("큰 글씨 제목이 네 줄로 나뉘어도(연결어로 끝나지 않아도) 한 제목이에요", () => {
+  const Q = [];
+  const T = (y, raw, w) => Q.push({ raw, x: 48, y, w, h: 16, font: "B" });
+  T(64, "Updating “The Future of", 186);
+  T(83, "Coding”: Qualitative", 154);
+  T(102, "Coding with Generative", 178);
+  T(121, "Large Language Models", 170);
+  Q.push({ raw: "Nga Than, Leanne Fan, Tina Law", x: 48, y: 160, w: 180, h: 11, font: "R" });
+  for (let i = 0; i < 12; i++) Q.push({ raw: "Body text line that runs across the whole column of the page here " + i, x: 48, y: 200 + i * 12, w: 340, h: 9.5, font: "R" });
+  const R = Core.buildLayout(Q);
+  const got = R.paras.map((p) => p.kind + ": " + R.text.slice(p.start, p.end));
+  assert.strictEqual(got[0], "heading: Updating “The Future of Coding”: Qualitative Coding with Generative Large Language Models", JSON.stringify(got));
+  assert.ok(got[1].includes("Nga Than"), JSON.stringify(got));
+});
+
+t("PDF 안 저장 순서가 뒤섞여도(본문이 먼저, 제목이 나중) 위치대로 읽어요", () => {
+  const Q = [];
+  // 저장 순서: 아래쪽 왼쪽 단 본문 -> 아래쪽 오른쪽 단 소속 -> 맨 위 제목 -> 초록
+  const body = ["Despite decades of reforms to remove gendered", "policies and practices from the workplace, and", "despite the fact that women now outperform", "men in higher education, women remain under-", "represented in leadership positions in both", "industry and academia. Substantial research has"];
+  body.forEach((r, i) => Q.push({ raw: r, x: 51, y: 549 + i * 12, w: 190, h: 10, font: "R" }));
+  ["aUniversity of British Columbia", "bUniversity of Southern California", "cIndiana University Bloomington", "dMass General Brigham Hospital"].forEach((r, i) => Q.push({ raw: r, x: 252, y: 549 + i * 10, w: 120, h: 6, font: "R" }));
+  ["Taking the Time: The", "Implications of Workplace", "Assessment for Organizational", "Gender Inequality"].forEach((r, i) => Q.push({ raw: r, x: 51, y: 90 + i * 20, w: 240, h: 18, font: "B" }));
+  Q.push({ raw: "Abstract", x: 51, y: 273, w: 40, h: 10, font: "B" });
+  for (let i = 0; i < 8; i++) Q.push({ raw: "Gendered differences in workload distribution shape who does tasks " + i + ".", x: 51, y: 287 + i * 11, w: 384, h: 9, font: "R" });
+  const R = Core.buildLayout(Q);
+  const got = R.paras.map((p) => R.text.slice(p.start, p.end));
+  const at = (s) => got.findIndex((g) => g.includes(s));
+  assert.ok(at("Taking the Time") === 0, JSON.stringify(got));
+  assert.ok(got[0].includes("Gender Inequality"), JSON.stringify(got));
+  assert.ok(at("Abstract") < at("Gendered differences") && at("Gendered differences") < at("Despite decades"), JSON.stringify(got));
+  assert.ok(at("Despite decades") < at("aUniversity"), JSON.stringify(got));
+  // 본문 문단은 소속 줄과 섞이지 않고 한 덩어리예요
+  assert.ok(got[at("Despite decades")].includes("Substantial research has") && !got[at("Despite decades")].includes("University"), JSON.stringify(got));
+});
+
+t("표·그림 제목을 찾고, 표를 가리키는 본문 문장은 빼요", () => {
+  const text = ["Table 1. Precision, Recall, and F1 Score", "Figure 3 shows the differences in means.", "figure 2. Regression Plot of Five Measures", "<표 1> 조사 항목의 기본 구성", "<표 6>에서 볼 수 있는 바와 같이", "그림 3. IRB 심의에 대한 대응"].join("\n");
+  let pos = 0;
+  const paras = text.split("\n").map((t) => { const p = { start: pos, end: pos + t.length, kind: "body" }; pos += t.length + 1; return p; });
+  const got = Core.figureCaptions(text, paras).map((f) => f.kind + ":" + f.label);
+  assert.deepStrictEqual(got, ["table:Table 1", "figure:Figure 2", "table:표 1", "figure:그림 3"]);
+});
+
+t("표 칸 글자는 번역 목록에서 빼요(제목이 위에 있는 표, 아래에 붙은 표)", () => {
+  const mk = (rows) => {
+    let text = "";
+    const paras = rows.map(([kind, fh, t]) => { if (text) text += "\n"; const p = { start: text.length, end: text.length + t.length, kind, fh }; text += t; return p; });
+    return { text, paras };
+  };
+  // 영어: 제목 -> 머리줄 -> 칸 -> Source -> 본문
+  const A = mk([
+    ["body", 10, "Women attendings wrote longer comments than men attendings in every hospital we studied, as Table 2 shows."],
+    ["heading", 9, "Table 2. Descriptive Statistics Aggregated by Attending and Resident Gender"],
+    ["heading", 9, "Mean Median Min. Max. Std.Dev. Count"],
+    ["body", 8, "Word Count 1,393 425 4 23,305 3044 85 Medical Terms Count 101 28 0 1,902 235 85"],
+    ["body", 8, "Source: Comments collected using InstantEval."],
+    ["body", 10, "The longer comment provides more opportunity for learning and improvement, for both the resident and the attending."],
+  ]);
+  const PA = Core.markFigureParas(A.text, A.paras, 10);
+  assert.deepStrictEqual(PA.map((p) => p.cell || p.kind), ["body", "heading", "Table 2", "Table 2", "body", "body"]);
+  // 한국어: 표 마지막 줄에 제목이 붙어 있고, 제목 뒤에는 인용문이 와요
+  const B = mk([
+    ["body", 10, "교육 내용이 지나치게 기초적이었다는 데 대한 동의 정도가 높게 나타났다. 반면 다른 문항은 낮았다."],
+    ["body", 8, "문항 전혀 동의안함 다소 동의안함 그저 그렇다 다소 동의함 매우 동의함 평균"],
+    ["body", 8, "(13) 16.4% (25) 40.8% (62) 29.6% (45) 4.6% (7) 3.05"],
+    ["body", 8, "(4) 15.8% (24) 27.0% (41) 36.2% (55) 18.4% (28) 3.52 <표 3> IRB 연구윤리 교육 관련 5점 척도 문항 (N=152)"],
+    ["body", 9.4, "강사분이 사실은 심리학 쪽이었던 것 같아요. 그러다 보니까 실험 설계 위주로 되게 많이 말씀을 하시는 바람에, 저 같은 경우는 (3A)"],
+  ]);
+  const PB = Core.markFigureParas(B.text, B.paras, 10);
+  const got = PB.map((p) => (p.cell ? "칸 " : p.kind + " ") + B.text.slice(p.start, p.end).slice(0, 12));
+  assert.deepStrictEqual(got, ["body 교육 내용이 지나치게 ", "칸 문항 전혀 동의안함 다", "칸 (13) 16.4% (", "칸 (4) 15.8% (2", "body <표 3> IRB 연구", "body 강사분이 사실은 심리학"]);
+});
+
+t("본문과 같은 크기 글씨의 표도 칸이 세로로 줄을 맞추면 칸으로 알아봐요", () => {
+  const Q = [];
+  const P = (x, y, raw, w) => Q.push({ raw, x, y, w, h: 10, font: "R" });
+  let y = 60;
+  for (let i = 0; i < 6; i++) { P(60, y, "Before the table we discuss how respondents answered the survey items in detail " + i + ".", 420); y += 13; }
+  y += 14;
+  P(60, y, "Table 5. Responses by Group", 160); y += 20;
+  const rows = [["Group", "Mean", "SD", "N"], ["Women attendings", "1,393", "3044", "85"], ["Men attendings", "1,169", "2160", "158"], ["Women residents", "462", "512", "222"], ["Men residents", "466", "452", "430"]];
+  for (const r of rows) { P(60, y, r[0], 100); P(220, y, r[1], 30); P(300, y, r[2], 30); P(380, y, r[3], 25); y += 14; }
+  y += 14;
+  for (let i = 0; i < 6; i++) { P(60, y, "After the table the argument continues with a longer discussion of what these numbers mean " + i + ".", 420); y += 13; }
+  const L = Core.buildLayout(Q);
+  const PB = Core.markFigureParas(L.text, L.paras, 10);
+  const cells = PB.filter((p) => p.cell === "Table 5").map((p) => L.text.slice(p.start, p.end));
+  assert.ok(cells.length >= 4 && cells.some((c) => c.includes("Men residents")), JSON.stringify(cells));
+  assert.ok(!cells.some((c) => /Before the table|After the table/.test(c)), JSON.stringify(cells));
+  // 표 줄이 아닌 본문 문단에는 표 표시가 없어요
+  assert.ok(!L.paras.some((p) => p.tab && /Before the table|After the table/.test(L.text.slice(p.start, p.end))));
+});
+
+t("문단 나누기가 바뀌어도 옛 번역을 문장별로 옮겨 써요(나뉜 제목은 이어 붙여요)", () => {
+  // 옛 저장본: 제목이 세 줄로 나뉘어 번역돼 있었고, 문장별 원문은 저장되지 않았어요.
+  const oldText = ["Updating The Future of Coding: Qualitative", "Coding with Generative", "Large Language Models", "Over the past decade, social scientists have adapted computational methods for qualitative text analysis since 2015. The emergence of GPT has transformed this process by shifting from programming to natural language in 2022."].join("\n");
+  const oldLines = ["「코딩의 미래」 다시 보기: 생성형", "대규모 언어 모델을 활용한", "질적 코딩", "지난 10여 년간(2015년 이후) 사회과학자들은 계산 방법을 질적 텍스트 분석에 맞게 활용해 왔다.", "GPT의 등장은 2022년에 이 과정을 바꾸었다."];
+  const g = Core.guessUnits(oldText, oldLines.length);
+  assert.ok(g && Core.numbersAgree(g, oldLines), JSON.stringify(g));
+  const newSrcs = ["Updating The Future of Coding: Qualitative Coding with Generative Large Language Models", "Over the past decade, social scientists have adapted computational methods for qualitative text analysis since 2015.", "The emergence of GPT has transformed this process by shifting from programming to natural language in 2022."];
+  const m = Core.mapSaved(g, oldLines, newSrcs);
+  assert.strictEqual(m.lines[0], "「코딩의 미래」 다시 보기: 생성형 대규모 언어 모델을 활용한 질적 코딩");
+  assert.strictEqual(m.lines[2], "GPT의 등장은 2022년에 이 과정을 바꾸었다.");
+  // 짝이 밀리면(숫자가 안 맞으면) 옮기지 않아요
+  assert.ok(!Core.numbersAgree(["In 1990 we saw 45 cases.", "By 2001 there were 67.", "The 1985 law changed 12 rules.", "Since 1999, 88 more."], ["2001년에는 67건이었다.", "1985년 법은 12개 규칙을 바꿨다.", "1999년 이후 88건.", "1990년에 45건."]));
+});
+
 console.log(`\n${pass}개 시험 모두 통과`);

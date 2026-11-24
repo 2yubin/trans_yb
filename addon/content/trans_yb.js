@@ -245,15 +245,303 @@ var TransYbCore = {
     return pieces.map((p) => ({ ...p, y: p.y - k * (p.x + (p.w || 0) / 2 - x0) }));
   },
 
+  /**
+   * 읽는 순서 정하기(XY-cut): PDF 안에 글자가 저장된 순서는 믿지 않고, 글자 위치만 봐요.
+   * 1) 쪽(또는 덩어리)을 위에서 아래까지 세로로 가르는 빈 띠(단 사이)가 있으면 왼쪽 -> 오른쪽으로 나눠요.
+   * 2) 없으면 가로로 비어 있는 줄 사이에서 위 -> 아래 띠로 나눠요.
+   *    같은 단 사이 띠를 함께 쓰는 띠들(두 단 본문 + 한쪽에만 있는 소제목)은 다시 합쳐서 단으로 나눠요.
+   * 3) 다 나눈 조각 중에서 위아래로 이어지고 폭이 같은 것(같은 단의 문단들)은 다시 합쳐 한 덩어리로 돌려줘요.
+   * 돌려주는 값: 읽는 순서대로 놓인 조각 번호 묶음들. 나눌 게 없으면 null.
+   */
+  readingOrder(pieces) {
+    const ps = pieces.map((p, i) => ({ ...p, i })).filter((p) => String(p.raw).trim() && p.w > 0);
+    if (ps.length < 8) return null;
+    const hsAll = [];
+    for (const p of ps) { const n = Math.min(String(p.raw).trim().length, 40); for (let k = 0; k < n; k++) hsAll.push(p.h || 10); }
+    hsAll.sort((a, b) => a - b);
+    const H = Math.max(hsAll[Math.floor(hsAll.length / 2)] || 10, 1);
+    // 조각 -> 줄: 같은 높이의 조각들을 왼쪽부터 놓고, 가로로 크게 떨어진 곳에서 나눠요(단 사이, 표 칸 사이).
+    const lines = [];
+    const byI = new Map(ps.map((p) => [p.i, p]));
+    for (const r of TransYbCore.rowsOf(pieces, ps.map((p) => p.i), H)) {
+      const rp = r.is.map((i) => byI.get(i)).sort((a, b) => a.x - b.x);
+      let cur = null;
+      for (const p of rp) {
+        const h = p.h || 10;
+        if (!cur || p.x > cur.right + H * 0.9) {
+          cur = { top: p.y, bottom: p.y + h, left: p.x, right: p.x + p.w, ps: [] };
+          lines.push(cur);
+        }
+        cur.ps.push(p);
+        cur.top = Math.min(cur.top, p.y);
+        cur.bottom = Math.max(cur.bottom, p.y + h);
+        cur.right = Math.max(cur.right, p.x + p.w);
+      }
+    }
+    const chars = (ls) => ls.reduce((n, l) => n + l.ps.reduce((m, p) => m + String(p.raw).trim().length, 0), 0);
+    // 덩어리를 위에서 아래까지 가르는 가장 넓은 빈 세로 띠 [a, b]
+    // 표 같은 덩어리: 같은 높이에 칸(떨어진 줄 조각)이 셋 이상 나란히 있는 줄이 많아요. 표는 단으로 가르지 않아요.
+    const tabular = (ls) => {
+      const rows = [];
+      for (const l of ls.slice().sort((a, b) => a.top - b.top)) {
+        const r = rows.find((r) => Math.min(r.bottom, l.bottom) - Math.max(r.top, l.top) > Math.min(r.bottom - r.top, l.bottom - l.top) * 0.5);
+        if (r) { r.n++; r.top = Math.min(r.top, l.top); r.bottom = Math.max(r.bottom, l.bottom); }
+        else rows.push({ top: l.top, bottom: l.bottom, n: 1 });
+      }
+      return rows.length >= 3 && rows.filter((r) => r.n >= 3).length >= rows.length * 0.3;
+    };
+    const gutter = (ls) => {
+      if (ls.length < 4 || tabular(ls)) return null;
+      const minX = Math.min(...ls.map((l) => l.left));
+      const maxX = Math.max(...ls.map((l) => l.right));
+      const iv = ls.map((l) => [l.left, l.right]).sort((a, b) => a[0] - b[0]);
+      let reach = iv[0][1];
+      let best = null;
+      for (let k = 1; k < iv.length; k++) {
+        if (iv[k][0] > reach) {
+          const a = reach;
+          const b = iv[k][0];
+          const mid = (a + b) / 2;
+          const inRange = mid > minX + (maxX - minX) * 0.15 && mid < minX + (maxX - minX) * 0.85;
+          if (inRange && b - a >= H * 0.9 && (!best || b - a > best[1] - best[0])) best = [a, b];
+        }
+        reach = Math.max(reach, iv[k][1]);
+      }
+      if (!best) return null;
+      const left = ls.filter((l) => l.right <= best[0] + 0.01);
+      const right = ls.filter((l) => l.left >= best[1] - 0.01);
+      if (left.length < 2 || right.length < 2) return null;
+      // 양쪽 줄이 모두 넉넉히 길어야 글 단이에요(표의 좁은 칸끼리는 단으로 나누지 않아요).
+      const medW = (a) => { const w = a.map((l) => l.right - l.left).sort((x, y) => x - y); return w[Math.floor(w.length / 2)]; };
+      if (medW(left) < H * 6 || medW(right) < H * 6) return null;
+      const all = chars(ls);
+      if (Math.min(chars(left), chars(right)) < all * 0.05) return null;
+      return { left, right };
+    };
+    // 가로 빈 줄 사이로 나눈 띠들(위 -> 아래)
+    const bands = (ls) => {
+      const s = ls.slice().sort((a, b) => a.top - b.top);
+      const out = [[s[0]]];
+      let bottom = s[0].bottom;
+      for (let k = 1; k < s.length; k++) {
+        if (s[k].top - bottom >= H * 0.8) out.push([]);
+        out[out.length - 1].push(s[k]);
+        bottom = Math.max(bottom, s[k].bottom);
+      }
+      return out;
+    };
+    const leaves = [];
+    // path: 어느 단 사이 띠의 어느 쪽에 있는지(같은 path 끼리는 같은 단이에요)
+    let gid = 0;
+    const cut = (ls, depth, path) => {
+      if (depth > 12 || ls.length <= 1) {
+        if (ls.length) leaves.push({ ls, path });
+        return;
+      }
+      const g = gutter(ls);
+      if (g) {
+        const id = gid++;
+        cut(g.left, depth + 1, path + "/" + id + "L");
+        cut(g.right, depth + 1, path + "/" + id + "R");
+        return;
+      }
+      const bs = bands(ls);
+      if (bs.length === 1) {
+        leaves.push({ ls, path });
+        return;
+      }
+      // 이웃한 띠들이 같은 단 사이 띠를 함께 쓰면 합쳐서 단으로 읽어요(두 단 본문이 소제목·빈 줄로 끊긴 경우).
+      let k = 0;
+      while (k < bs.length) {
+        let grp = bs[k];
+        let j = k + 1;
+        if (gutter(grp)) {
+          while (j < bs.length && gutter(grp.concat(bs[j]))) grp = grp.concat(bs[j++]);
+        }
+        cut(grp, depth + 1, path);
+        k = j;
+      }
+    };
+    cut(lines, 0, "");
+    if (leaves.length <= 1) return null;
+    // 같은 단(같은 path)에서 위아래로 이어지는 조각들은 다시 하나로(문단 나누기는 buildLayoutOne 이 해요)
+    const groups = [];
+    for (const lf of leaves) {
+      const last = groups[groups.length - 1];
+      if (last && last.path === lf.path) last.ls.push(...lf.ls);
+      else groups.push({ ls: lf.ls.slice(), path: lf.path });
+    }
+    if (groups.length <= 1) return null;
+    // 조각 번호 묶음. 빈 조각은 바로 앞 조각과 같은 묶음에 둬요.
+    const groupOf = new Map();
+    groups.forEach((g, gi) => { for (const l of g.ls) for (const p of l.ps) groupOf.set(p.i, gi); });
+    const out = groups.map(() => []);
+    let lastG = 0;
+    pieces.forEach((p, i) => {
+      const gi = groupOf.has(i) ? groupOf.get(i) : lastG;
+      out[gi].push(i);
+      lastG = gi;
+    });
+    return out.filter((g) => g.length).map((g) => TransYbCore.sortGroup(pieces, g, H));
+  },
+
+  // 묶음 안 순서: 저장 순서가 위로 거슬러 올라가거나 같은 줄에서 왼쪽으로 크게 되돌아가는 곳이 없으면 그대로 둬요.
+  // 있으면 줄(위 -> 아래), 줄 안(왼쪽 -> 오른쪽) 순서로 다시 놓아요. 빈 조각은 바로 앞 조각 뒤에 붙여요.
+  sortGroup(pieces, idxs, H) {
+    const has = (i) => String(pieces[i].raw).trim() && pieces[i].w > 0;
+    const real = idxs.filter(has);
+    let messy = false;
+    for (let k = 1; k < real.length && !messy; k++) {
+      const a = pieces[real[k - 1]];
+      const b = pieces[real[k]];
+      const h = Math.max(a.h || 10, b.h || 10);
+      if (b.y + (b.h || 10) < a.y - H * 0.5) messy = true; // 위로 거슬러 올라감
+      else if (Math.abs(b.y - a.y) < h * 0.3 && b.x + b.w < a.x - H * 2) messy = true; // 같은 줄에서 왼쪽으로 되돌아감
+    }
+    if (!messy) return idxs;
+    const rows = TransYbCore.rowsOf(pieces, real, H);
+    const tail = new Map(); // 글자 조각 -> 뒤따르는 빈 조각들
+    const realSet = new Set(real);
+    let lastReal = null;
+    const lead = [];
+    for (const i of idxs) {
+      if (realSet.has(i)) lastReal = i;
+      else if (lastReal === null) lead.push(i);
+      else (tail.get(lastReal) || tail.set(lastReal, []).get(lastReal)).push(i);
+    }
+    const out = lead.slice();
+    for (const r of rows) for (const i of r.is.sort((a, b) => pieces[a].x - pieces[b].x || a - b)) out.push(i, ...(tail.get(i) || []));
+    return out;
+  },
+
+  // 조각들을 줄로 묶어요(위 -> 아래). 보통 크기 조각은 줄 가운데 높이가 가까우면 같은 줄,
+  // 작은 조각(위첨자, 각주 번호)은 가장 많이 겹치는 줄에 붙여요.
+  rowsOf(pieces, idxs, H) {
+    const mid = (p) => p.y + (p.h || 10) / 2;
+    const big = idxs.filter((i) => (pieces[i].h || 10) >= H * 0.7).sort((a, b) => mid(pieces[a]) - mid(pieces[b]));
+    const small = idxs.filter((i) => (pieces[i].h || 10) < H * 0.7);
+    const rows = [];
+    for (const i of big) {
+      const p = pieces[i];
+      const h = p.h || 10;
+      const r = rows[rows.length - 1];
+      if (r && Math.abs(mid(p) - r.mid) < Math.min(h, r.h) * 0.4) {
+        r.is.push(i);
+        r.top = Math.min(r.top, p.y);
+        r.bottom = Math.max(r.bottom, p.y + h);
+      } else rows.push({ mid: mid(p), h, top: p.y, bottom: p.y + h, is: [i] });
+    }
+    for (const i of small) {
+      const p = pieces[i];
+      const h = p.h || 10;
+      let best = null;
+      let bestOv = 0;
+      for (const r of rows) {
+        const ov = Math.min(r.bottom, p.y + h) - Math.max(r.top, p.y);
+        if (ov > bestOv) { bestOv = ov; best = r; }
+      }
+      if (best && bestOv >= h * 0.3) best.is.push(i);
+      else rows.push({ mid: mid(p), h, top: p.y, bottom: p.y + h, is: [i] });
+    }
+    rows.sort((a, b) => a.mid - b.mid);
+    return rows;
+  },
+
   buildLayout(piecesRaw) {
     const L = TransYbCore.buildLayoutCols(piecesRaw);
     L.text = TransYbCore.repairBrokenCaps(L.text);
+    TransYbCore.markTabular(piecesRaw, L);
     return L;
+  },
+
+  /**
+   * 표 줄 알아보기(글자 크기와 상관없이 위치로): 같은 높이에 크게 떨어진 칸이 셋 이상 나란히 있으면 표 줄이에요.
+   * 위아래가 모두 표 줄인 줄(칸 안에서 줄바꿈된 글, 행 이름)도 표 줄로 봐요. 돌려주는 값: 표 줄에 있는 조각 번호들
+   */
+  tabularPieces(pieces) {
+    const idxs = [];
+    pieces.forEach((p, i) => { if (String(p.raw).trim() && p.w > 0) idxs.push(i); });
+    if (idxs.length < 12) return new Set();
+    const hs = [];
+    for (const i of idxs) { const n = Math.min(String(pieces[i].raw).trim().length, 40); for (let k = 0; k < n; k++) hs.push(pieces[i].h || 10); }
+    hs.sort((a, b) => a - b);
+    const H = Math.max(hs[Math.floor(hs.length / 2)] || 10, 1);
+    const rows = TransYbCore.rowsOf(pieces, idxs, H).map((r) => {
+      const ps = r.is.map((i) => pieces[i]).sort((a, b) => a.x - b.x);
+      const lefts = [];
+      let right = -Infinity;
+      for (const p of ps) {
+        if (p.x > right + H * 0.9) lefts.push(p.x);
+        right = Math.max(right, p.x + p.w);
+      }
+      return { ...r, lefts, tab: false };
+    });
+    // 진짜 표는 칸이 세로로 줄을 맞춰요: 칸이 셋 이상인 줄 가운데, 이웃 줄(위아래 12줄 안)과
+    // 칸 시작 위치(맨 앞 칸 빼고)가 맞는 줄만 표 줄이에요. 글자 사이가 들쭉날쭉한 본문은 맞지 않아요.
+    const cand = rows.map((r) => r.lefts.length >= 3);
+    const match = (a, b) => {
+      let n = 0;
+      for (const x of a.lefts.slice(1)) if (b.lefts.slice(1).some((y) => Math.abs(x - y) < H * 0.6)) n++;
+      return n;
+    };
+    // (양쪽 맞춤으로 낱말 사이가 크게 벌어진 본문 줄이 우연히 맞는 것을 빼려고, 칸의 절반 이상이 이웃 줄 둘 이상과 맞아야 해요)
+    rows.forEach((r, k) => {
+      if (!cand[k]) return;
+      const need = (x) => Math.max(2, Math.ceil((x.lefts.length - 1) * 0.5));
+      let hits = 0;
+      for (let j = Math.max(0, k - 12); j < Math.min(rows.length, k + 13); j++) {
+        // 서로 맞춰 봐요: 두 줄 모두 칸의 절반 이상이 상대 줄과 맞아야 같은 표의 줄이에요.
+        if (j !== k && cand[j] && match(r, rows[j]) >= need(r) && match(rows[j], r) >= need(rows[j])) hits++;
+      }
+      if (hits >= 2) r.tab = true;
+    });
+    const near = (a, b) => Math.abs(a.mid - b.mid) <= H * 3.5;
+    for (let k = 1; k < rows.length - 1; k++) {
+      if (rows[k].tab) continue;
+      let up = false;
+      let down = false;
+      for (let j = k - 1; j >= 0 && near(rows[j], rows[k]); j--) if (rows[j].tab) { up = true; break; }
+      for (let j = k + 1; j < rows.length && near(rows[j], rows[k]); j++) if (rows[j].tab) { down = true; break; }
+      if (up && down) rows[k].wrapTab = true;
+    }
+    const out = new Set();
+    for (const r of rows) if (r.tab || r.wrapTab) for (const i of r.is) out.add(i);
+    return out;
+  },
+
+  // 문단마다 글자의 절반 넘게 표 줄에 있으면 p.tab = true
+  markTabular(pieces, L) {
+    const tab = TransYbCore.tabularPieces(pieces);
+    if (!tab.size) return;
+    const paras = L.paras;
+    const all = paras.map(() => 0);
+    const inTab = paras.map(() => 0);
+    const find = (pos) => {
+      let lo = 0;
+      let hi = paras.length - 1;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (paras[mid].end < pos) lo = mid + 1;
+        else if (paras[mid].start > pos) hi = mid - 1;
+        else return mid;
+      }
+      return -1;
+    };
+    L.ranges.forEach((r, i) => {
+      if (!r) return;
+      const k = find(r.start);
+      if (k < 0) return;
+      const n = r.end - r.start;
+      all[k] += n;
+      if (tab.has(i)) inTab[k] += n;
+    });
+    paras.forEach((p, k) => { if (all[k] && inTab[k] > all[k] * 0.5) p.tab = true; });
   },
 
   buildLayoutCols(piecesRaw) {
     const piecesIn = TransYbCore.deskew(piecesRaw);
-    const cols = TransYbCore.splitColumns(piecesIn);
+    // 글자 위치로 읽는 순서를 정해요(XY-cut). 못 나누면 예전 방식(두 단 나누기)으로 해요.
+    const cols = TransYbCore.readingOrder(piecesIn) || TransYbCore.splitColumns(piecesIn);
     if (!cols) return TransYbCore.buildLayoutOne(piecesIn);
     // 위쪽 가로 줄 -> 왼쪽 단 -> 오른쪽 단 -> 아래쪽 가로 줄 순서로 읽어요. 위치 정보는 원래 조각 번호로 되돌려요.
     const blocks = []; // { one, idxs, pa, join }  join = 앞 문단에 이어 붙음
@@ -263,9 +551,11 @@ var TransYbCore = {
     for (const p of piecesIn) { const n = Math.min(String(p.raw).trim().length, 40); for (let k = 0; k < n; k++) hs.push(p.h || 10); }
     hs.sort((a, b) => a - b);
     const pageH = hs.length ? hs[Math.floor(hs.length / 2)] : 0;
+    const vis = piecesIn.filter((p) => String(p.raw).trim() && p.w > 0);
+    const pageBox = { top: Math.min(...vis.map((p) => p.y)), bottom: Math.max(...vis.map((p) => p.y + (p.h || 10))) };
     const endsS = (t) => /[.!?:;。？！]["'”’)\]]*[¹²³⁰-⁹\d*†‡]{0,3}$/.test(t.trim());
     for (const idxs of cols) {
-      const one = TransYbCore.buildLayoutOne(idxs.map((i) => piecesIn[i]), pageH);
+      const one = TransYbCore.buildLayoutOne(idxs.map((i) => piecesIn[i]), pageH, pageBox);
       if (!one.text) continue;
       const mine = one.paras.map((pa) => ({ one, idxs, pa }));
       // 단을 넘어가는 문장: 앞 단의 마지막 본문 문단이 문장 중간에서 끝났고(뒤에는 각주·쪽 번호만 있음),
@@ -277,7 +567,9 @@ var TransYbCore = {
         const host = k >= 0 ? blocks[k] : null;
         const hostText = host && host.one.text.slice(host.pa.start, host.pa.end);
         const firstText = first.one.text.slice(first.pa.start, first.pa.end);
-        if (host && host.pa.kind === "body" && !endsS(hostText) && /^[\p{Ll}\d(“"‘']/u.test(firstText) && host.idxs !== first.idxs) {
+        // 글자 크기가 확 다르면(본문 -> 각주·소속 줄) 이어진 문장이 아니에요.
+        const sameSize = !host || !host.pa.fh || !first.pa.fh || Math.abs(host.pa.fh - first.pa.fh) < host.pa.fh * 0.15;
+        if (host && host.pa.kind === "body" && sameSize && !endsS(hostText) && /^[\p{Ll}\d(“"‘']/u.test(firstText) && host.idxs !== first.idxs) {
           first.join = true;
           first.hy = /[\p{L}]-$/u.test(hostText);
           blocks.splice(k + 1, 0, mine.shift());
@@ -344,7 +636,7 @@ var TransYbCore = {
     return chars.join("");
   },
 
-  buildLayoutOne(piecesIn, baseH = 0) {
+  buildLayoutOne(piecesIn, baseH = 0, pageBox = null) {
     // 0) 큰 첫 글자(E|nglish): 크기와 위치를 다음 조각에 맞춰 같은 줄의 한 단어로 붙여요.
     const pieces = piecesIn.map((p) => ({ ...p }));
     for (let i = 0; i < pieces.length - 1; i++) {
@@ -373,11 +665,14 @@ var TransYbCore = {
       const h = p.h || 10;
       const mid = p.y + h / 2;
       const sameLine =
-        cur && Math.abs(mid - cur.mid) < Math.max(h, cur.h) * 0.5 && p.x >= cur.right - cur.h * 0.5;
+        cur && Math.abs(mid - cur.mid) < Math.max(h, cur.h) * 0.5 &&
+        // (PDF 가 알려 주는 글자 폭이 실제보다 넓어 앞 조각과 겹쳐 보여도, 앞 조각보다 오른쪽에서 시작하면 같은 줄이에요)
+        p.x >= Math.min(cur.right - cur.h * 0.5, cur.lastX + cur.h * 0.2);
       if (!sameLine) {
         cur = { items: [], left: p.x, right: p.x + p.w, top: p.y, bottom: p.y + h, h, mid };
         lines.push(cur);
       }
+      cur.lastX = p.x;
       cur.items.push({ idx, t, map, x: p.x, w: p.w, raw: p.raw, font: p.font || "" });
       cur.right = Math.max(cur.right, p.x + p.w);
       cur.left = Math.min(cur.left, p.x);
@@ -521,6 +816,15 @@ var TransYbCore = {
           ln.top - prev.bottom < prev.fh * 1.6 &&
           /([:\-–—,&]|\b(of|and|the|in|for|on|to|with|a|an))\s*$/i.test(prev.text.trim())
         ) brk = false;
+        // 같은 글꼴, 같은 크기의 (본문보다 1.4배 넘게) 큰 글씨 줄이 촘촘한 줄 간격으로 이어지면 한 제목이에요
+        // (예: "Coding”: Qualitative" / "Coding with Generative" / "Large Language Models").
+        if (
+          prev.fh > Math.max(BIG, H * 1.4) && ln.fh > Math.max(BIG, H * 1.4) && Math.abs(ln.fh - prev.fh) < prev.fh * 0.08 &&
+          ln.font && prev.font && ln.font === prev.font &&
+          ln.top - prev.bottom < prev.fh * 0.6 && ln.top >= prev.top &&
+          !/[.!?;。？！]["'”’)\]]*$/.test(prev.text.trim()) && !/^\d{1,4}$/.test(prev.text.trim()) &&
+          !TransYbCore.BOILER_LINE.test(ln.text) && !TransYbCore.BOILER_LINE.test(prev.text)
+        ) brk = false;
         // 저작권(©), DOI 같은 안내 줄은 앞뒤 줄과 항상 따로예요
         if (TransYbCore.BOILER_LINE.test(ln.text) || TransYbCore.BOILER_LINE.test(prev.text)) brk = true;
       }
@@ -549,8 +853,9 @@ var TransYbCore = {
       prev = ln;
     }
     if (para) para.end = text.length;
-    const pageTop = Math.min(...real.map((l) => l.top));
-    const pageBottom = Math.max(...real.map((l) => l.bottom));
+    // 쪽 맨 위·맨 아래: 덩어리로 나눠 읽을 때도 쪽 전체 기준이에요.
+    const pageTop = pageBox ? pageBox.top : Math.min(...real.map((l) => l.top));
+    const pageBottom = pageBox ? pageBox.bottom : Math.max(...real.map((l) => l.bottom));
 
     // 3) 문단 종류: 제목, 참고문헌, 기타(쪽 번호 등), 본문
     let inRefs = false;
@@ -567,6 +872,7 @@ var TransYbCore = {
       const numbered = /^(\d{1,2}(\.\d{1,2})*\.?|[IVX]{1,4}\.)\s+[\p{Lu}"“‘']/u.test(t);
       const hs = p.lines.map((l) => l.fh).sort((a, b) => a - b);
       const ph = hs[Math.floor(hs.length / 2)];
+      p.fh = ph; // 문단 글자 크기(단을 넘어 이을 때 비교해요)
       const atEdge = Math.min(...p.lines.map((l) => l.top)) - pageTop < H * 2.5 || pageBottom - Math.max(...p.lines.map((l) => l.bottom)) < H * 2.5;
       p.edge = atEdge && (pi <= 1 || pi >= paras.length - 2);
       const hasYear = /\b(1[6-9]|20)\d{2}[a-z]?\b/.test(t);
@@ -786,6 +1092,119 @@ var TransYbCore = {
     return [P.map[k], P.map[k + A.length - 1] + 1];
   },
 
+  /* ---------- 저장된 번역 다시 쓰기 ----------
+   * 문단 나누기가 바뀌어도(새 버전) 한 번 번역한 문장은 다시 번역하지 않아요.
+   * 저장된 원문 문장(srcs)과 새 문장을 글자(소문자, 글자와 숫자만)로 맞춰서 번역을 옮겨요.
+   * 예전에 문장별 원문 없이 저장된 번역은, 저장된 쪽 글자에서 문장 경계를 복원해서 맞춰요.
+   */
+  // 예전 저장본의 문장 원문 복원: 쪽 글자를 문단(줄바꿈)으로 나누고, 문단마다 "통째로" 또는 "문장별"로 나눈 것 중
+  // 번역 문장 수(count)와 맞는 조합을 골라요. 긴 본문은 문장별, 짧은 글·참고문헌은 통째로를 더 그럴듯하게 봐요.
+  // hint(문단 글자) -> "split" | "whole" | null : 새 문단 나누기에서 같은 문단이 본문(문장별)인지 알려 줘요.
+  guessUnits(text, count, hint = null) {
+    const paras = String(text || "").split("\n");
+    const opts = paras.map((p) => {
+      const sents = TransYbCore.splitSentences(p).map((s) => p.slice(s.start, s.end));
+      const refLike = /^([•◦▪●‣∙·–—-]\s*)?[\p{Lu}][\p{L}'’\-]+,\s+\p{Lu}/u.test(p) && /\b(1[6-9]|20)\d{2}/.test(p);
+      const prose = p.length > 150 && !refLike;
+      const hn = hint ? hint(p) : null;
+      return { whole: [p], split: sents.length ? sents : [p], preferSplit: hn ? hn === "split" : prose, strong: !!hn };
+    });
+    const n = paras.length;
+    if (!count || count > 4000) return null;
+    // dp[i][c]: 앞 i 문단으로 c 문장을 만들 때 가장 높은 점수
+    const NEG = -1e9;
+    let dp = new Float64Array(count + 1).fill(NEG);
+    dp[0] = 0;
+    const choice = [];
+    for (let i = 0; i < n; i++) {
+      const nd = new Float64Array(count + 1).fill(NEG);
+      const ch = new Int8Array(count + 1).fill(-1);
+      const o = opts[i];
+      const w = o.strong ? 3 : 1;
+      const ks = [[0, o.whole.length, o.preferSplit ? 0 : w], [1, o.split.length, o.preferSplit ? w : 0]];
+      for (let c = 0; c <= count; c++) {
+        if (dp[c] === NEG) continue;
+        for (const [which, k, sc] of ks) {
+          if (c + k > count) continue;
+          if (dp[c] + sc > nd[c + k]) { nd[c + k] = dp[c] + sc; ch[c + k] = which; }
+        }
+      }
+      choice.push(ch);
+      dp = nd;
+    }
+    if (dp[count] === NEG) return null;
+    // 되짚어 가며 고른 조합을 꺼내요
+    const out = [];
+    let c = count;
+    for (let i = n - 1; i >= 0; i--) {
+      const which = choice[i][c];
+      const part = which === 1 ? opts[i].split : opts[i].whole;
+      out.unshift(...part);
+      c -= part.length;
+    }
+    return out.length === count ? out : null;
+  },
+
+  // 옛 문장들 -> 새 문장들. 새 문장 하나가 옛 문장 여러 개를 합친 것이면(나뉘었던 제목 등) 번역을 이어 붙여요.
+  // 돌려주는 값: { lines: [새 문장별 번역 또는 null], from: [새 문장별 옛 문장 번호 목록 또는 null] }
+  mapSaved(oldSrcs, oldLines, newSrcs, skip = []) {
+    const key = (s) => TransYbCore.titleKey(s);
+    const ok = oldSrcs.map(key);
+    const used = new Array(ok.length).fill(false);
+    const byKey = new Map();
+    ok.forEach((k, i) => { if (k) (byKey.get(k) || byKey.set(k, []).get(k)).push(i); });
+    const byHead = new Map();
+    ok.forEach((k, i) => { if (k) { const h = k.slice(0, 8); (byHead.get(h) || byHead.set(h, []).get(h)).push(i); } });
+    const lines = newSrcs.map(() => null);
+    const from = newSrcs.map(() => null);
+    newSrcs.forEach((s, i) => {
+      if (skip[i]) return;
+      const k = key(s);
+      if (!k) return;
+      const same = (byKey.get(k) || []).find((j) => !used[j]);
+      if (same !== undefined) {
+        used[same] = true;
+        lines[i] = oldLines[same];
+        from[i] = [same];
+        return;
+      }
+      // 옛 문장 여러 개를 이어 붙이면 같은 글이 되는지
+      for (const st of byHead.get(k.slice(0, 8)) || []) {
+        if (used[st]) continue;
+        let acc = "";
+        const run = [];
+        for (let j = st; j < ok.length && run.length < 8; j++) {
+          if (used[j] || !ok[j]) break;
+          acc += ok[j];
+          run.push(j);
+          if (!k.startsWith(acc)) break;
+          if (acc === k && run.length > 1) {
+            for (const r of run) used[r] = true;
+            lines[i] = run.map((r) => String(oldLines[r] || "").trim()).join(" ");
+            from[i] = run;
+            return;
+          }
+        }
+      }
+    });
+    return { lines, from };
+  },
+
+  // 문장 짝이 맞는지 검사: 원문에 있는 두 자리 이상 숫자(연도, 쪽수, 통계값)가 번역에도 있어야 해요.
+  // 숫자가 있는 문장 중 어긋난 것이 25%(적어도 1개)를 넘으면 짝을 잘못 지은 거예요(각주 번호 하나쯤은 빠질 수 있어요).
+  numbersAgree(srcs, lines) {
+    let checked = 0;
+    let bad = 0;
+    srcs.forEach((s, i) => {
+      const nums = String(s || "").match(/\d{2,}/g);
+      const ln = String(lines[i] || "");
+      if (!nums || !ln) return;
+      checked++;
+      if (!nums.some((x) => ln.includes(x))) bad++;
+    });
+    return checked < 3 || bad <= Math.max(1, checked * 0.25);
+  },
+
   // 제목 비교용: 소문자, 글자와 숫자만
   titleKey(t) {
     return String(t || "").toLowerCase().normalize("NFKC").replace(/[^\p{L}\p{N}]+/gu, "");
@@ -799,6 +1218,167 @@ var TransYbCore = {
     if (a === b) return true;
     const ratio = a.length / b.length;
     return ratio > 0.85 && ratio < 1.2 && (a.startsWith(b.slice(0, 30)) || b.startsWith(a.slice(0, 30)));
+  },
+
+  // 표·그림 제목 줄: "Table 1. ...", "Figure 2 ...", "<표 1> ...", "그림 3. ..." 로 시작하는 짧은 문단.
+  // "Table 1 shows ..." 처럼 본문 문장이 표를 가리키는 경우는 빼요(번호 뒤가 소문자 낱말).
+  FIG_RE: /^\s*(?:[<〈［\[]\s*)?([Tt]able|TABLE|[Ff]igure|FIGURE|[Ff]ig\.?|FIG\.?|[Cc]hart|[Ee]xhibit|[Gg]raph|[Pp]late|표|그림|도표|사진)\s*([A-Z]?\d{1,3}(?:[.\-–]\d{1,3})?[a-z]?)\s*(?:[>〉］\]])?([.:|]|\s+(?=[\p{Lu}\p{Lo}"“‘(])|$)/u,
+
+  // 제목 맞춤 결과 -> { kind: "table" | "figure", label: "Table 1" | "그림 3" }
+  figLabel(m) {
+    const word = m[1].toLowerCase();
+    const kind = /^(table|표|도표)$/.test(word) ? "table" : "figure";
+    const en = { table: "Table", figure: "Figure", fig: "Figure", "fig.": "Figure", chart: "Chart", exhibit: "Exhibit", graph: "Graph", plate: "Plate" }[word];
+    return { kind, label: (en || m[1]) + " " + m[2] };
+  },
+
+  figureCaptions(text, paras) {
+    const out = [];
+    const seen = new Set();
+    paras.forEach((p, pi) => {
+      if (p.kind === "other" || p.kind === "ref") return;
+      const t = text.slice(p.start, p.end).trim();
+      if (t.length > 700) return;
+      const m = TransYbCore.FIG_RE.exec(t);
+      if (!m) return;
+      const { kind, label } = TransYbCore.figLabel(m);
+      if (seen.has(label.toLowerCase())) return;
+      seen.add(label.toLowerCase());
+      out.push({ label, kind, para: pi, caption: t.replace(/\s+/g, " ") });
+    });
+    return out;
+  },
+
+  // 표·그림 안 글자 골라내기: 표 칸 글자는 번역 목록에 조각으로 섞이지 않게 숨기고(kind "other", cell: 표 이름),
+  // 해석 칸으로만 보내요. 두 줄로 쪼개진 표·그림 제목은 하나로 합쳐요. 새 문단 목록을 돌려줘요.
+  // - 표: 제목 다음부터 "Source/Note/자료/출처" 줄(이 줄은 번역해요), 본문 크기의 긴 글, 다음 제목 앞까지가 칸이에요.
+  // - 그림: 제목 바로 앞의 짧고 작은 글씨 문단(축 이름, 범례)이 그림 안 글자예요.
+  // 여러 쪽의 본문 글자 크기: 본문 문단 글자 수로 가중한 중앙값. layouts: [{ text, paras }]
+  bodySize(layouts) {
+    const hs = [];
+    for (const L of layouts) for (const p of L.paras) if (p.kind === "body" && p.fh) for (let k = 0; k < Math.min(p.end - p.start, 2000); k += 10) hs.push(p.fh);
+    hs.sort((a, b) => a - b);
+    return hs.length ? hs[Math.floor(hs.length / 2)] : 0;
+  },
+
+  NOTE_LINE: /^\s*(Sources?|Notes?|Data|자료|출처|주|비고)\s*[:：.)]/i,
+
+  markFigureParas(text, parasIn, bodyFhIn = 0) {
+    const paras = parasIn.map((p) => ({ ...p }));
+    const tx = (p) => text.slice(p.start, p.end).trim();
+    const isCap = (p) => p.kind !== "other" && p.kind !== "ref" && TransYbCore.FIG_RE.test(tx(p));
+    // 본문 글자 크기: 본문 문단 글자 수로 가중한 중앙값
+    const hs = [];
+    for (const p of paras) if (p.kind === "body" && p.fh) for (let k = 0; k < Math.min(tx(p).length, 400); k += 10) hs.push(p.fh);
+    hs.sort((a, b) => a - b);
+    // (표가 쪽 대부분을 차지하면 이 쪽만으로는 본문 크기를 잘못 재서, 앞뒤 쪽까지 잰 값을 받아 써요)
+    const bodyFh = bodyFhIn || (hs.length ? hs[Math.floor(hs.length / 2)] : 0);
+    const small = (p) => bodyFh && p.fh && p.fh < bodyFh * 0.95;
+    // 표 줄 표시(위치로 알아낸 것). 다만 200자 넘고 숫자가 적은 긴 글은 표시가 있어도 본문으로 봐요(양쪽 맞춤 본문이 잘못 잡히는 것 막기).
+    const tabOf = (p) => {
+      if (!p.tab) return false;
+      const t = text.slice(p.start, p.end);
+      return !(t.length >= 200 && (t.match(/\d/g) || []).length < t.length * 0.05);
+    };
+    const prose = (p) => {
+      const t = tx(p);
+      const words = t.split(/\s+/).filter((w) => /\p{Ll}{2,}/u.test(w)).length;
+      const digits = (t.match(/\d/g) || []).length;
+      return t.length >= 160 && words >= 20 && digits < t.length * 0.08 && /[.!?。]["”’)]*$/.test(t);
+    };
+    // 0) 표 마지막 줄에 붙은 제목 떼기: "... 18.4% (28) 3.52 <표 3> IRB 연구윤리 교육 관련 문항 (N=152)"
+    //    앞부분이 숫자가 많은 칸 글자이고, 제목이 문단 끝까지 이어지는 짧은 글이면 두 문단으로 나눠요.
+    for (let i = 0; i < paras.length; i++) {
+      const p = paras[i];
+      if (p.kind === "other" || p.kind === "ref") continue;
+      const t = text.slice(p.start, p.end);
+      const m = /\s(?:[<〈]\s*(?:표|그\s?림|도표)\s*\d{1,3}\s*[>〉]|(?:Table|TABLE|Figure|FIGURE|Fig\.)\s*[A-Z]?\d{1,3}[.:])\s*\S/u.exec(t);
+      if (!m || m.index < 3) continue;
+      const head = t.slice(0, m.index);
+      const tail = t.slice(m.index + 1);
+      const digits = (head.match(/\d/g) || []).length;
+      // (앞부분이 본문보다 작은 글씨면 숫자가 적어도 칸으로 봐요)
+      if (tail.length > 160 || (digits < head.replace(/\s/g, "").length * 0.2 && !(small(p) && digits >= 3))) continue;
+      const cut = p.start + m.index + 1;
+      paras.splice(i + 1, 0, { ...p, start: cut, end: p.end, kind: "body" });
+      p.end = p.start + m.index;
+      i++;
+    }
+    // 1) 쪼개진 제목 합치기: 제목이 문장부호 없이 끝나고, 다음 문단이 같은 글자 크기의 짧은 이어진 글이면 붙여요.
+    for (let i = 0; i < paras.length - 1; i++) {
+      if (!isCap(paras[i])) continue;
+      const a = paras[i];
+      const b = paras[i + 1];
+      const bt = tx(b);
+      if (/[.!?:。]["”’)]*$/.test(tx(a)) || isCap(b) || TransYbCore.NOTE_LINE.test(bt) || b.kind === "other") continue;
+      const sameSize = !a.fh || !b.fh || Math.abs(a.fh - b.fh) < a.fh * 0.08;
+      // 표 머리줄("Mean Median Min.")과 나누려고, 이어진 제목에는 and, of, by 같은 작은 낱말이 있어야 해요.
+      const phrase = /\b(and|of|by|for|in|the|with|across|to|from|on|at|among|between|vs\.?)\b|및|의|에 따른|별/.test(bt);
+      if (sameSize && phrase && bt.length < 200 && !/\d[\d.,\s]{6,}/.test(bt) && b.start - a.end <= 1) {
+        a.end = b.end;
+        paras.splice(i + 1, 1);
+      }
+    }
+    // 2) 칸 글자 숨기기
+    for (let i = 0; i < paras.length; i++) {
+      const cap = paras[i];
+      if (!isCap(cap)) continue;
+      const m = TransYbCore.FIG_RE.exec(tx(cap));
+      const { kind: fk, label } = TransYbCore.figLabel(m);
+      const isTable = fk === "table";
+      // 칸인지 보는 규칙(표 제목 앞쪽으로 거슬러 갈 때 써요)
+      const cellBack = (p, t, j) => !((p.edge && j <= 1) || isCap(p) || TransYbCore.NOTE_LINE.test(t) || p.kind === "note" ||
+        (!tabOf(p) && (p.kind === "heading" && !small(p) || (bodyFh ? !small(p) && t.length >= 40 : prose(p)))));
+      let hidden = 0;
+      if (isTable) {
+        for (let j = i + 1; j < paras.length && j <= i + 600; j++) {
+          const p = paras[j];
+          const t = tx(p);
+          if (TransYbCore.NOTE_LINE.test(t)) {
+            if (p.kind === "other") p.cell = label; // 숨겨진 표 주석도 해석 칸에는 보내요
+            break;
+          }
+          if (isCap(p) || p.kind === "note") break;
+          // 제목 바로 뒤가 문장으로 된 긴 글(인용문 등)이면 표는 제목 위에 있어요.
+          // (끝이 쉼표로 끊긴 인용문도 있어서, 첫 문단은 문장부호로 끝나지 않아도 길고 숫자가 적으면 글로 봐요)
+          if (!hidden && p.kind !== "other" && bodyFh && !small(p) && !tabOf(p)) break; // 제목 뒤 첫 문단이 본문 크기면 표가 아니에요
+          // (짧은 인용문도 있어서 50자 넘고 문장부호로 끝나면 글로 봐요. 표 머리줄은 문장부호로 끝나지 않아요)
+          if (!hidden && p.kind !== "other" && !tabOf(p) && (t.length >= 80 || (t.length >= 50 && /[.!?)”’」]\s*$/.test(t))) && (t.match(/\d/g) || []).length < t.length * 0.08) break;
+          if (p.kind === "other") {
+            if (!/^\d{1,4}$/.test(t)) p.cell = label; // 작은 글씨라 이미 숨긴 칸도 해석 칸에는 보내요
+            continue;
+          }
+          // 본문 크기 이상의 긴 글이나 소제목이 나오면 표가 끝난 거예요(본문 크기를 모르면 문장다운 긴 글로 봐요).
+          // (표 줄에 있는 문단은 본문과 같은 크기 글씨여도 칸이에요)
+          if (!tabOf(p) && (bodyFh ? !small(p) && (t.length >= 40 || p.kind === "heading") : prose(p))) break;
+          p.kind = "other";
+          p.cell = label;
+          hidden++;
+        }
+        // 제목 아래에 칸이 없으면 제목이 표 아래에 있는 거예요(한국어 논문에 흔해요). 제목 앞쪽의 칸을 숨겨요.
+        if (!hidden) {
+          for (let j = i - 1; j >= 0 && j >= i - 600; j--) {
+            const p = paras[j];
+            const t = tx(p);
+            if (p.kind === "other" && !p.cell) continue;
+            if (!cellBack(p, t, j)) break;
+            p.kind = "other";
+            p.cell = label;
+          }
+        }
+      } else {
+        for (let j = i - 1; j >= 0 && j >= i - 30; j--) {
+          const p = paras[j];
+          const t = tx(p);
+          if (p.kind === "other" && !p.cell) continue;
+          if ((p.edge && j <= 1) || isCap(p) || TransYbCore.NOTE_LINE.test(t)) break;
+          if (!tabOf(p) && (t.length >= 60 || prose(p) || !small(p))) break; // (쪽 맨 위 머리말은 빼요)
+          p.kind = "other";
+          p.cell = label;
+        }
+      }
+    }
+    return paras;
   },
 
   // 번역 단위 만들기: 본문은 문장으로, 제목/참고문헌/기타는 문단 통째로 하나.
@@ -1993,10 +2573,12 @@ var TransYb = {
     // 옆 페이지(앞뒤 두 쪽)의 맨 위/맨 아래 줄 모으기
     const n = this.numPages(reader);
     const seen = new Set();
+    const near = [L]; // 본문 글자 크기를 잴 쪽들(이 쪽과 앞뒤 두 쪽)
     for (const q of [pageIndex - 2, pageIndex - 1, pageIndex + 1, pageIndex + 2]) {
       if (q < 0 || (n && q >= n)) continue;
       try {
         const o = (await this.rawLayout(reader, q)).L;
+        near.push(o);
         for (const op of o.paras) if (op.edge) seen.add(this.boilerKey(o.text.slice(op.start, op.end)));
       } catch (e) {}
     }
@@ -2006,12 +2588,31 @@ var TransYb = {
       const att = Zotero.Items.get(reader.itemID);
       paperTitle = (att?.parentItem || att)?.getField("title") || "";
     } catch (e) {}
+    // 여러 줄로 나뉜 제목: 이어지는 제목 문단을 합친 글자가 논문 제목과 같으면 한 문단으로 합쳐요.
+    if (paperTitle) {
+      for (let i = 0; i < paras.length; i++) {
+        if (paras[i].kind !== "heading") continue;
+        for (let j = i + 1; j < Math.min(paras.length, i + 5) && paras[j].kind === "heading"; j++) {
+          if (TransYbCore.isPaperTitle(L.text.slice(paras[i].start, paras[j].end), paperTitle)) {
+            paras[i].end = paras[j].end;
+            paras.splice(i + 1, j - i);
+            break;
+          }
+        }
+      }
+    }
     for (const p of paras) {
       if (p.kind === "other") continue;
       if (TransYbCore.isPaperTitle(L.text.slice(p.start, p.end), paperTitle)) {
         p.kind = "heading";
         p.isTitle = true;
       }
+    }
+    // 표 칸 글자는 번역 목록에서 숨기고 해석 칸으로 보내요. 쪼개진 표·그림 제목은 합쳐요.
+    {
+      const fixed = TransYbCore.markFigureParas(L.text, paras, TransYbCore.bodySize(near));
+      paras.length = 0;
+      paras.push(...fixed);
     }
     // 앞 쪽들에 "Notes" 제목이 있고 아직 끝나지 않았으면, 이 쪽의 문단도 주석이에요.
     let notesOpen = false;
@@ -2111,6 +2712,7 @@ var TransYb = {
       rec.boiler = j.boiler || [];
       rec.notes = j.notes || {};
       rec.meta = j.meta || {};
+      rec.figs = j.figs || {};
     } catch (e) {}
     if (Object.keys(rec.pages).length) this.started.add(itemID);
     this.fileLog(`cache loaded for ${rec.key}: ${Object.keys(rec.pages).length} pages`);
@@ -2128,7 +2730,7 @@ var TransYb = {
         await Zotero.File.createDirectoryIfMissingAsync(this.cacheDir(), { from: Zotero.DataDirectory.dir });
         await Zotero.File.putContentsAsync(
           this.cacheDir() + "/" + rec.key + ".json",
-          JSON.stringify({ pages: rec.pages, underlines: rec.underlines, boiler: rec.boiler || [], notes: rec.notes || {}, meta: rec.meta || {} })
+          JSON.stringify({ pages: rec.pages, underlines: rec.underlines, boiler: rec.boiler || [], notes: rec.notes || {}, meta: rec.meta || {}, figs: rec.figs || {} })
         );
       } catch (e) {
         this.fileLog("cache save failed: " + this.errText(e));
@@ -2147,12 +2749,27 @@ var TransYb = {
     const entry = rec.pages[pageIndex];
     // 예전 형식({target, lines})도 읽어요.
     const saved = entry?.byTarget ? entry.byTarget[target] : entry?.target === target ? entry : null;
-    if (!saved || entry.text !== built.text || saved.lines?.length !== built.sentences.length) {
-      return null;
-    }
+    if (!saved) return null;
     // 쪽을 넘는 문장이 있는 쪽인데, 문장 합치기(xpage)를 넣기 전에 번역한 것이면 새로 번역해요(잘린 문장으로 번역돼 있어서)
     if ((saved.xpage || 0) < 2 && built.sentences.some((u) => u.joinNext || u.contPrev)) return null;
-    const page = { ...built, lines: saved.lines, headings: saved.headings || null, bylines: saved.bylines || null, engine: saved.engine, lang: null, target };
+    const savedText = saved.text ?? entry.text;
+    let page;
+    if (savedText === built.text && saved.lines?.length === built.sentences.length) {
+      page = { ...built, lines: saved.lines, headings: saved.headings || null, bylines: saved.bylines || null, engine: saved.engine, lang: null, target };
+      // 예전 저장본이면 문장별 원문을 채워 둬요(다음에 문단 나누기가 바뀌어도 정확히 옮기게).
+      if (!Array.isArray(saved.srcs) && entry.byTarget) {
+        saved.srcs = built.sentences.map((u) => TransYbCore.unitSource(built.text, u, built.soft));
+        saved.text = built.text;
+        this.saveDisk(itemID);
+      }
+    } else {
+      // 문단 나누기가 바뀌었어요(새 버전). 옛 번역을 문장별로 옮겨 쓰고, 모두 옮겨지면 새로 번역하지 않아요.
+      const re = this.reuseSaved(entry, saved, built);
+      if (!re || re.missing.length) return null; // 일부만 옮겨지면 getTranslation 이 빠진 문장만 번역해요
+      page = { ...built, lines: re.lines, headings: re.headings, bylines: re.bylines, engine: saved.engine, lang: null, target };
+      await this.storePage(itemID, built, target, page, { relocateMarks: true });
+      this.fileLog(`page ${pageIndex + 1}: reused saved translation after layout change (${re.reused} sentences, 0 tokens)`);
+    }
     if (!this.cache.has(itemID)) this.cache.set(itemID, new Map());
     this.cache.get(itemID).set(pageIndex, page);
     return page;
@@ -2199,25 +2816,26 @@ var TransYb = {
         return saved;
       }
       const built = await this.buildPage(reader, pageIndex);
+      // 옛 번역에서 옮길 수 있는 문장은 옮기고, 빠진 문장만 번역해요.
+      let known = null;
+      try {
+        const rec0 = await this.diskFor(itemID);
+        const e0 = rec0.pages[pageIndex];
+        const s0 = e0?.byTarget ? e0.byTarget[target] : e0?.target === target ? e0 : null;
+        if (s0 && !((s0.xpage || 0) < 2 && built.sentences.some((u) => u.joinNext || u.contPrev))) known = this.reuseSaved(e0, s0, built);
+        if (known && !known.reused) known = null;
+      } catch (e) {
+        known = null;
+      }
       await this.acquire(opts.front, key);
       let page;
       try {
-        page = await this.translateBuilt(reader, built, target);
+        page = await this.translateBuilt(reader, built, target, known);
       } finally {
         this.release();
       }
-      const rec = await this.diskFor(itemID);
-      const old = rec.pages[pageIndex];
-      // 이 쪽을 새로 번역했으니, 칠해 둔 표시는 원문 주석을 기준으로 새 번역문에서 위치를 다시 찾아요.
-      const marks = rec.underlines?.[pageIndex];
-      if (marks?.length) {
-        for (const m of marks) m.relocate = true;
-        this._repairedPages?.delete(itemID + ":" + pageIndex);
-      }
-      const byTarget = old?.text === built.text ? { ...(old.byTarget || (old.target ? { [old.target]: old } : {})) } : {};
-      byTarget[target] = { engine: page.engine, lines: page.lines, headings: page.headings, bylines: page.bylines, xpage: 2 };
-      rec.pages[pageIndex] = { text: built.text, byTarget };
-      this.saveDisk(itemID);
+      if (known) this.fileLog(`page ${pageIndex + 1}: reused ${known.reused} saved sentences, translated ${known.missing.length}`);
+      await this.storePage(itemID, built, target, page, { relocateMarks: true });
       if (!this.cache.has(itemID)) this.cache.set(itemID, new Map());
       this.cache.get(itemID).set(pageIndex, page);
       return page;
@@ -2233,8 +2851,63 @@ var TransYb = {
     return p;
   },
 
+  // 이 쪽 번역을 저장해요. 언어마다 그때의 쪽 글자(text)와 문장별 원문(srcs)을 함께 남겨서,
+  // 다음에 문단 나누기가 바뀌어도 문장 단위로 옮겨 쓸 수 있게 해요. 다른 언어 번역은 지우지 않아요.
+  async storePage(itemID, built, target, page, opts = {}) {
+    const rec = await this.diskFor(itemID);
+    const old = rec.pages[built.pageIndex];
+    if (opts.relocateMarks) {
+      // 번역문이나 문장 번호가 바뀌었으니, 칠해 둔 표시는 원문 주석을 기준으로 위치를 다시 찾아요.
+      const marks = rec.underlines?.[built.pageIndex];
+      if (marks?.length) {
+        for (const m of marks) m.relocate = true;
+        this._repairedPages?.delete(itemID + ":" + built.pageIndex);
+      }
+    }
+    const byTarget = {};
+    if (old) {
+      const prev = old.byTarget || (old.target ? { [old.target]: old } : {});
+      for (const [t, v] of Object.entries(prev)) byTarget[t] = { ...v, text: v.text ?? old.text };
+    }
+    byTarget[target] = {
+      engine: page.engine, lines: page.lines, headings: page.headings, bylines: page.bylines, xpage: 2,
+      text: built.text, srcs: built.sentences.map((u) => TransYbCore.unitSource(built.text, u, built.soft)),
+    };
+    rec.pages[built.pageIndex] = { text: built.text, byTarget };
+    this.saveDisk(itemID);
+  },
+
+  // 저장된 번역(entry, saved)을 새 문단 나누기(built)에 옮겨요.
+  // 돌려주는 값: { lines, headings, bylines, engine, reused, missing: [번역이 필요한 새 문장 번호] } 또는 null
+  reuseSaved(entry, saved, built) {
+    if (!Array.isArray(saved?.lines) || !saved.lines.length) return null;
+    const text = saved.text ?? entry.text;
+    let srcs = Array.isArray(saved.srcs) && saved.srcs.length === saved.lines.length ? saved.srcs : null;
+    if (!srcs) {
+      // 예전 저장본: 쪽 글자에서 문장 경계를 복원해요. 새 문단 나누기의 문단 종류를 힌트로 써요.
+      const kinds = new Map(built.paras.map((p) => [TransYbCore.titleKey(built.text.slice(p.start, p.end)), p.kind === "body" ? "split" : "whole"]));
+      srcs = TransYbCore.guessUnits(text, saved.lines.length, (t) => kinds.get(TransYbCore.titleKey(t)) || null);
+      if (!srcs || !TransYbCore.numbersAgree(srcs, saved.lines)) return null;
+    }
+    const units = built.sentences;
+    const newSrcs = units.map((u) => TransYbCore.unitSource(built.text, u, built.soft));
+    const skip = units.map((u) => u.kind === "other" || u.contPrev);
+    const m = TransYbCore.mapSaved(srcs, saved.lines, newSrcs, skip);
+    const lines = units.map((u, i) => (u.contPrev ? "" : u.kind === "other" ? newSrcs[i] : m.lines[i]));
+    const missing = units.map((u, i) => i).filter((i) => !skip[i] && m.lines[i] == null);
+    // 옛 제목·저자 표시: 옮긴 문장의 첫 옛 번호가 표시돼 있었으면 새 번호도 표시해요.
+    const remap = (arr) => {
+      if (!Array.isArray(arr)) return null;
+      const set = new Set(arr);
+      return units.map((u, i) => i).filter((i) => m.from[i] && set.has(m.from[i][0]));
+    };
+    const reused = units.filter((u, i) => !skip[i] && m.lines[i] != null).length;
+    return { lines, headings: remap(saved.headings), bylines: remap(saved.bylines), engine: saved.engine, reused, missing };
+  },
+
   // 문단 정보가 준비된 페이지를 실제로 번역해요.
-  async translateBuilt(reader, built, target) {
+  // known: { lines, headings, bylines } 옛 번역에서 옮긴 문장(null 이 아닌 것)은 보내지 않아요.
+  async translateBuilt(reader, built, target, known = null) {
     const ctx = {};
     try {
       const att = Zotero.Items.get(reader.itemID);
@@ -2258,7 +2931,7 @@ var TransYb = {
     }
     const units = built.sentences;
     // 쪽 번호, 머리말 같은 "other"는 번역하지 않고 그대로 둬요.
-    const toSend = units.map((u, i) => i).filter((i) => units[i].kind !== "other" && !units[i].contPrev);
+    const toSend = units.map((u, i) => i).filter((i) => units[i].kind !== "other" && !units[i].contPrev && known?.lines?.[i] == null);
     const srcOf = (i) => {
       const own = TransYbCore.unitSource(built.text, units[i], built.soft);
       const nx = units[i].joinNext?.text;
@@ -2274,10 +2947,19 @@ var TransYb = {
           ctx
         );
     const lines = units.map((u) => (u.contPrev ? "" : TransYbCore.unitSource(built.text, u, built.soft)));
+    if (known) known.lines.forEach((ln, i) => { if (ln != null && units[i].kind !== "other" && !units[i].contPrev) lines[i] = ln; });
     toSend.forEach((i, k) => (lines[i] = res.lines[k]));
-    const headings = Array.isArray(res.headings) ? res.headings.map((k) => toSend[k]) : null;
-    const bylines = Array.isArray(res.bylines) ? res.bylines.map((k) => toSend[k]) : null;
-    return { ...built, lines, headings, bylines, lang: res.lang, engine: res.engine, target };
+    let headings = Array.isArray(res.headings) ? res.headings.map((k) => toSend[k]) : null;
+    let bylines = Array.isArray(res.bylines) ? res.bylines.map((k) => toSend[k]) : null;
+    if (known) {
+      // 옮긴 문장의 제목·저자 표시도 합쳐요(옛 표시가 없으면 새 표시만, 둘 다 없으면 문단 종류를 따라요)
+      const merge = (a, b) => (a || b ? [...new Set([...(a || []), ...(b || [])])].sort((x, y) => x - y) : null);
+      // (옛 저장본에 제목 표시가 없으면, 옮긴 문장 중 문단 종류가 제목인 것을 제목으로 봐요)
+      const kept = (k) => units.map((u, i) => i).filter((i) => known.lines[i] != null && units[i].kind === k);
+      if (headings || known.headings) headings = merge(headings, known.headings ?? kept("heading"));
+      if (bylines || known.bylines) bylines = merge(bylines, known.bylines ?? []);
+    }
+    return { ...built, lines, headings, bylines, lang: res.lang, engine: res.engine || known?.engine || null, target };
   },
 
   // 지금 페이지 다음 두 쪽을 몰래 미리 번역해 둬요.
@@ -2446,6 +3128,246 @@ var TransYb = {
     box[num] = { src: text, text: out };
     this.saveDisk(reader.itemID);
     return out;
+  },
+
+  /* ---------- 표·그림 해석 ----------
+   * 표·그림 제목 옆 단추를 누르면, 그 쪽을 그림 파일로 만들어 지금 고른 엔진(Claude Code, Codex, Claude API)에 보내요.
+   * 엔진은 그림과 쪽 글자를 함께 보고, 표를 읽는 법, 눈에 띄는 결과, 논문에서의 의미, 해석할 때 조심할 점을 알려 줘요.
+   * 결과는 저장해서 다시 쓰고 토큰을 아껴요. Google 엔진은 그림을 볼 수 없어서 쓰지 않아요.
+   */
+  FIG_SCHEMA: {
+    type: "object",
+    properties: {
+      title: { type: "string" },
+      summary: { type: "string" },
+      how_to_read: { type: "string" },
+      findings: { type: "array", items: { type: "string" } },
+      meaning: { type: "string" },
+      caution: { type: "string" },
+    },
+    required: ["title", "summary", "how_to_read", "findings", "meaning", "caution"],
+    additionalProperties: false,
+  },
+
+  figPrompt(fig, target, ctx) {
+    const lang = this.LANG_NAMES[target] || target;
+    const style = target === "ko" ? "Korean, in the polite 해요체 style, short sentences" : lang;
+    const system =
+      "You explain tables and figures in academic papers to a graduate student who reads the paper in translation. " +
+      "You receive an image of one PDF page and the text extracted from that page. Explain only the requested table or figure. " +
+      `Write every field in ${style}. Keep technical terms with the original English in parentheses the first time. ` +
+      "Rules: use only what is visible in the image or written on the page; never invent numbers, variables, or significance levels. " +
+      "Copy numbers exactly as printed. If something is unreadable or not shown, say so instead of guessing. " +
+      "Fields: title = the caption translated; summary = one or two sentences on what it shows; " +
+      "how_to_read = what the rows/columns or axes, units, symbols, abbreviations, and panels mean; " +
+      "findings = three to six key patterns, each with the specific numbers; " +
+      "meaning = what this result means for the paper's argument, based on how the page text discusses it (say so if the page does not discuss it); " +
+      "caution = limits for interpretation (for example descriptive only, no significance test shown, small n), or an empty string.";
+    const user =
+      (ctx.title ? `Paper: ${ctx.title}\n` : "") +
+      `Explain this ${fig.kind === "table" ? "table" : "figure"}: ${fig.label}\nCaption: ${fig.caption}\n\n` +
+      `Page ${ctx.pageNumber} text (may be out of order inside the table):\n${String(ctx.pageText || "").slice(0, 9000)}`;
+    return { system, user };
+  },
+
+  // 쪽 한 장을 PNG 파일로 만들어요(긴 쪽이 1600px 쯤). 돌려주는 값: { path, b64 }
+  async renderPagePng(reader, pageIndex) {
+    const v = this.viewer(reader);
+    const pdfDoc = this.pdfDocument(reader);
+    if (!v || !pdfDoc?.getPage) throw this.userErr("PDF를 아직 다 읽지 못했어요. 잠시 뒤 다시 눌러 주세요.");
+    let dataURL = null;
+    try {
+      const page = await pdfDoc.getPage(pageIndex + 1);
+      const rp = page?.wrappedJSObject ?? page;
+      const rawWin = v.iframeWin.wrappedJSObject ?? v.iframeWin;
+      const base = rp.getViewport(Components.utils.cloneInto({ scale: 1 }, v.iframeWin));
+      const scale = Math.min(3, 1600 / Math.max(Number(base.width) || 600, Number(base.height) || 800));
+      const vp = rp.getViewport(Components.utils.cloneInto({ scale }, v.iframeWin));
+      const canvas = v.doc.createElement("canvas");
+      canvas.width = Math.ceil(vp.width);
+      canvas.height = Math.ceil(vp.height);
+      const ctx = canvas.getContext("2d");
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      const params = new rawWin.Object();
+      params.canvasContext = ctx.wrappedJSObject ?? ctx;
+      params.viewport = vp.wrappedJSObject ?? vp;
+      await rp.render(params).promise;
+      dataURL = canvas.toDataURL("image/png");
+    } catch (e) {
+      this.fileLog("page render failed, using on-screen canvas: " + this.errText(e));
+      // 화면에 그려져 있는 쪽 그림을 써요.
+      const cv = v.pdfViewer.getPageView(pageIndex)?.canvas;
+      if (cv && cv.width) dataURL = cv.toDataURL("image/png");
+    }
+    if (!dataURL || dataURL.length < 100) throw this.userErr("이 쪽을 그림으로 만들지 못했어요. 그 쪽을 화면에 띄운 뒤 다시 눌러 주세요.");
+    const b64 = dataURL.slice(dataURL.indexOf(",") + 1);
+    const dir = Zotero.DataDirectory.dir + "/trans_yb/figs";
+    await Zotero.File.createDirectoryIfMissingAsync(dir, { from: Zotero.DataDirectory.dir });
+    const att = Zotero.Items.get(reader.itemID);
+    const path = `${dir}/${att?.key || reader.itemID}-p${pageIndex + 1}.png`;
+    // (플러그인 코드가 도는 곳에는 atob, IOUtils 가 없을 수 있어서 조테로 창의 것을 써요)
+    const win = Zotero.getMainWindow();
+    const bin = (typeof atob === "function" ? atob : win.atob.bind(win))(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    await (typeof IOUtils !== "undefined" ? IOUtils : win.IOUtils).write(path, bytes);
+    return { path, b64, dir };
+  },
+
+  figKey(pageIndex, label) {
+    return pageIndex + ":" + String(label).toLowerCase();
+  },
+
+  savedFigure(itemID, pageIndex, fig) {
+    const target = this.pref("targetLang") || "ko";
+    const rec = this.disk.get(itemID);
+    const hit = rec?.figs?.[target]?.[this.figKey(pageIndex, fig.label)];
+    return hit && hit.caption === fig.caption ? hit : null;
+  },
+
+  // 표·그림 하나를 해석해요. force 면 저장본이 있어도 새로 해요.
+  async figureExplanation(reader, page, fig, force = false) {
+    const target = this.pref("targetLang") || "ko";
+    const rec = await this.diskFor(reader.itemID);
+    rec.figs = rec.figs || {};
+    const box = (rec.figs[target] = rec.figs[target] || {});
+    const key = this.figKey(page.pageIndex, fig.label);
+    if (!force && box[key] && box[key].caption === fig.caption) return box[key];
+    const engine = this.pref("engine") || "claude-code";
+    if (engine === "google") throw this.userErr("Google 엔진은 그림을 볼 수 없어요. 번역 엔진 설정에서 Claude Code, Codex, Claude API 중 하나를 골라 주세요.");
+    let title = "";
+    try {
+      const att = Zotero.Items.get(reader.itemID);
+      title = (att?.parentItem || att)?.getField("title") || "";
+    } catch (e) {}
+    const pageText = page.paras
+      .filter((p) => p.kind !== "other" || p.cell)
+      .map((p) => (p.cell ? `[${p.cell} 안 글자] ` : "") + TransYbCore.unitSource(page.text, p, page.soft))
+      .join("\n");
+    const { system, user } = this.figPrompt(fig, target, { title, pageText, pageNumber: page.pageIndex + 1 });
+    const img = await this.renderPagePng(reader, page.pageIndex);
+    const started = Date.now();
+    let out;
+    if (engine === "claude-code") out = await this.figClaudeCode(system, user, img);
+    else if (engine === "codex") out = await this.figCodex(system, user, img);
+    else out = await this.figClaudeApi(system, user, img);
+    if (!out || typeof out.summary !== "string") throw this.userErr("해석을 받지 못했어요. 다시 눌러 주세요.");
+    this.fileLog(`figure ${fig.label} on page ${page.pageIndex + 1}: ${engine} ok, ${Date.now() - started} ms`);
+    const res = { ...out, findings: Array.isArray(out.findings) ? out.findings.map(String) : [], caption: fig.caption, engine, at: new Date().toISOString().slice(0, 10) };
+    box[key] = res;
+    this.saveDisk(reader.itemID);
+    return res;
+  },
+
+  async runCli(bin, args, workdir) {
+    const { Subprocess } = ChromeUtils.importESModule("resource://gre/modules/Subprocess.sys.mjs");
+    const home = Services.dirsvc.get("Home", Ci.nsIFile).path;
+    const proc = await Subprocess.call({
+      command: bin,
+      arguments: args,
+      workdir,
+      environment: { HOME: home, PATH: "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:" + home + "/.local/bin" },
+      environmentAppend: true,
+      stderr: "stdout",
+    });
+    proc.stdin.close();
+    let out = "";
+    let chunk;
+    while ((chunk = await proc.stdout.readString())) out += chunk;
+    const { exitCode } = await proc.wait();
+    return { out, exitCode };
+  },
+
+  cliFail(name, text) {
+    if (/log ?in|auth|credential|sign in|unauthorized/i.test(text)) return this.userErr(`${name}에 로그인이 안 되어 있어요.`);
+    if (/limit|quota|usage|rate/i.test(text)) return this.userErr(`${name} 사용 한도에 걸렸어요. 잠시 뒤 다시 눌러 주세요.`);
+    return this.userErr(`${name}로 해석하지 못했어요. 다시 눌러 주세요.`);
+  },
+
+  // Claude Code: 그림 읽기(Read) 도구만 켜서, 그림 파일이 있는 폴더 안에서만 읽게 해요.
+  async figClaudeCode(system, user, img) {
+    const bin = this.findClaudeCode();
+    if (!bin) throw this.userErr("이 맥에서 Claude Code를 찾지 못했어요. 번역 엔진 설정에서 다른 엔진을 골라 주세요.");
+    const r = await this.runCli(
+      bin,
+      ["-p", "--output-format", "json", "--no-session-persistence", "--strict-mcp-config", "--setting-sources=",
+        "--tools", "Read", "--allowedTools", "Read", "--json-schema", JSON.stringify(this.FIG_SCHEMA),
+        "--system-prompt", system + " First open the page image with the Read tool.",
+        `Page image file: ${img.path}\n\n${user}`],
+      img.dir
+    );
+    let d = null;
+    try {
+      d = JSON.parse(r.out);
+    } catch (e) {}
+    if (!d || d.is_error || r.exitCode !== 0) {
+      this.fileLog("figure claude code error: " + String(d?.result || r.out).slice(-400));
+      throw this.cliFail("Claude Code", String(d?.result || r.out));
+    }
+    try {
+      return d.structured_output || JSON.parse(d.result);
+    } catch (e) {
+      return null;
+    }
+  },
+
+  // Codex: 그림을 -i 로 붙여 보내요(읽기 전용).
+  async figCodex(system, user, img) {
+    const bin = this.findCodex();
+    if (!bin) throw this.userErr("이 맥에서 Codex를 찾지 못했어요. 번역 엔진 설정에서 다른 엔진을 골라 주세요.");
+    const work = Zotero.DataDirectory.dir + "/trans_yb/codex";
+    await Zotero.File.createDirectoryIfMissingAsync(work, { from: Zotero.DataDirectory.dir });
+    const sp = work + "/fig-schema.json";
+    await Zotero.File.putContentsAsync(sp, JSON.stringify(this.FIG_SCHEMA));
+    const op = work + "/fig-" + Date.now() + ".txt";
+    const r = await this.runCli(bin, ["exec", "--ephemeral", "--skip-git-repo-check", "-s", "read-only", "-C", work, "--output-schema", sp, "-o", op, "-i", img.path, "--", system + "\n\n" + user], work);
+    try {
+      const d = JSON.parse(await Zotero.File.getContentsAsync(op));
+      Zotero.File.removeIfExists(op);
+      return d;
+    } catch (e) {
+      this.fileLog("figure codex error (exit " + r.exitCode + "): " + r.out.slice(-400).replace(/\s+/g, " "));
+      throw this.cliFail("Codex", r.out.slice(-600));
+    }
+  },
+
+  async figClaudeApi(system, user, img) {
+    const key = String(this.pref("anthropicKey") || "").trim();
+    if (!key) throw this.userErr("Claude API 키가 없어요. 아래 설정에서 키를 넣어 주세요.");
+    let xhr;
+    try {
+      xhr = await Zotero.HTTP.request("POST", "https://api.anthropic.com/v1/messages", {
+        headers: { "content-type": "application/json", "x-api-key": key, "anthropic-version": "2026-10-21" },
+        body: JSON.stringify({
+          model: this.pref("claudeModel") || "claude-opus-5-5",
+          max_tokens: 6000,
+          system,
+          output_config: { effort: "medium", format: { type: "json_schema", schema: this.FIG_SCHEMA } },
+          messages: [{
+            role: "user",
+            content: [
+              { type: "image", source: { type: "base64", media_type: "image/png", data: img.b64 } },
+              { type: "text", text: user },
+            ],
+          }],
+        }),
+        responseType: "json",
+        timeout: 180000,
+        successCodes: false,
+      });
+    } catch (e) {
+      throw this.userErr("Claude 서버에 연결하지 못했어요. 인터넷 연결을 확인해 주세요.");
+    }
+    if (xhr.status !== 200) {
+      this.fileLog("figure claude api " + xhr.status + ": " + JSON.stringify(xhr.response).slice(0, 300));
+      throw this.userErr(`Claude API 오류(${xhr.status})로 해석하지 못했어요.`);
+    }
+    try {
+      return JSON.parse((xhr.response?.content || []).find((b) => b.type === "text")?.text || "");
+    } catch (e) {
+      return null;
+    }
   },
 
   /* ---------- 형광펜과 밑줄 ----------
@@ -3470,6 +4392,21 @@ var TransYb = {
         border-top: .5px solid var(--tyb-sep); padding-top: 6px; }
       .tyb-note-src:empty { display: none; }
       .tyb-ref { padding-left: 1.4em; text-indent: -1.4em; opacity: .9; }
+      .tyb-caption { font-weight: 600; }
+      .tyb-fig { margin-top: -4px; display: flex; flex-direction: column; gap: 6px; }
+      .tyb-figbtn { -moz-appearance: none; appearance: none; align-self: flex-start; height: 22px; padding: 0 10px;
+        border-radius: 11px; border: .5px solid var(--tyb-sep); background: var(--tyb-fill); color: var(--tyb-text);
+        font: inherit; font-size: .85em; font-weight: 500; cursor: pointer; }
+      .tyb-figbtn:hover { background: var(--tyb-card); }
+      .tyb-figpanel { padding: 10px 12px; border-radius: 10px; background: var(--tyb-card); border: .5px solid var(--tyb-sep);
+        display: flex; flex-direction: column; gap: 8px; line-height: 1.55; font-size: .95em; }
+      .tyb-figtitle { font-weight: 700; }
+      .tyb-figlab { font-size: .75em; letter-spacing: .06em; color: var(--tyb-label); margin-bottom: 2px; }
+      .tyb-figsec ul { margin: 0; padding-left: 1.2em; }
+      .tyb-figsec li + li { margin-top: 3px; }
+      .tyb-figwait { color: var(--tyb-label); }
+      .tyb-fighint { font-size: .78em; color: var(--tyb-label); }
+      .tyb-figfoot { font-size: .78em; color: var(--tyb-label); border-top: .5px solid var(--tyb-sep); padding-top: 6px; }
       .tyb-other { display: none; }
       .tyb-unit { border-radius: 3px; padding: 1px 0; transition: background .12s; }
       .tyb-unit:hover { background: light-dark(rgba(0,0,0,.05), rgba(255,255,255,.07)); }
@@ -4301,6 +5238,8 @@ var TransYb = {
         // Claude가 맥락을 보고 고른 제목 번호가 있으면 그것만 제목으로 보여 줘요.
         const isHead = (i) =>
           page.sentences[i].title || (Array.isArray(page.headings) ? page.headings.includes(i) : page.sentences[i].kind === "heading");
+        // 표·그림 제목 문단 -> 해석 단추를 그 문단 바로 아래에 붙여요.
+        const figByPara = new Map(TransYbCore.figureCaptions(page.text, page.paras).map((f) => [f.para, f]));
         let paraEl = null;
         let lastPara = null;
         page.sentences.forEach((u, i) => {
@@ -4340,6 +5279,11 @@ var TransYb = {
             paraEl.className = "tyb-para tyb-" + (shown === "note" ? "fnote" : shown);
             el.appendChild(paraEl);
             textEls.push(paraEl);
+            const fig = figByPara.get(u.para);
+            if (fig) {
+              paraEl.classList.add("tyb-caption");
+              el.appendChild(this.figWidget(page, fig));
+            }
           } else {
             paraEl.appendChild(doc.createTextNode(" "));
           }
@@ -4391,6 +5335,108 @@ var TransYb = {
           rows.push(span);
         });
         return { el, page, rows, textEls };
+      },
+
+      // 표·그림 해석: 단추를 누르면 아래 칸이 펼쳐지고, 저장된 해석이 없으면 엔진에 물어봐요.
+      figWidget(page, fig) {
+        const name = fig.kind === "table" ? "표" : "그림";
+        const key = page.itemID + ":" + self.figKey(page.pageIndex, fig.label);
+        this._figOpen = this._figOpen || new Set();
+        this._figBusy = this._figBusy || new Map();
+        const box = h("div");
+        box.className = "tyb-fig";
+        const btn = h("button");
+        btn.className = "tyb-figbtn";
+        const panel = h("div");
+        panel.className = "tyb-figpanel";
+        box.append(btn, panel);
+        // 번역 목록에서 숨긴 표·그림 안 글자 수
+        const cells = page.paras.filter((p) => p.cell === fig.label).length;
+        if (cells) {
+          const hint = h("div", null, `${name} 안 글자 ${cells}조각은 번역 목록에서 빼고, 이 해석 칸에서 풀어 줘요.`);
+          hint.className = "tyb-fighint";
+          box.insertBefore(hint, panel);
+        }
+        const setBtn = () => {
+          const open = this._figOpen.has(key);
+          const saved = self.savedFigure(page.itemID, page.pageIndex, fig);
+          btn.textContent = (open ? "▾ " : "▸ ") + `${name} 해석` + (saved || open ? "" : " (눌러서 분석)");
+          btn.title = `${fig.label}이(가) 무엇을 보여 주는지, 어떻게 읽는지, 무슨 뜻인지 풀어 줘요`;
+          panel.style.display = open ? "" : "none";
+        };
+        const section = (label, body) => {
+          if (!body || (Array.isArray(body) && !body.length)) return;
+          const sec = h("div");
+          sec.className = "tyb-figsec";
+          sec.appendChild(h("div", null, label)).className = "tyb-figlab";
+          if (Array.isArray(body)) {
+            const ul = h("ul");
+            for (const b of body) ul.appendChild(h("li", null, b));
+            sec.appendChild(ul);
+          } else sec.appendChild(h("div", null, body));
+          panel.appendChild(sec);
+        };
+        const show = (res) => {
+          panel.textContent = "";
+          if (res.title) panel.appendChild(h("div", null, res.title)).className = "tyb-figtitle";
+          section("한눈에", res.summary);
+          section(fig.kind === "table" ? "표 읽는 법" : "그림 읽는 법", res.how_to_read);
+          section("눈에 띄는 결과", res.findings);
+          section("논문에서의 의미", res.meaning);
+          section("해석할 때 조심할 점", res.caution);
+          const foot = h("div");
+          foot.className = "tyb-figfoot";
+          foot.appendChild(doc.createTextNode(`${res.engine === "claude-code" ? "Claude Code" : res.engine === "codex" ? "Codex" : "Claude API"} · ${res.at || ""} · AI 해석이라 원문 표·그림과 꼭 대조해 주세요 · `));
+          const again = h("button", null, "다시 해석");
+          again.className = "tyb-link";
+          again.addEventListener("click", (e) => {
+            e.stopPropagation();
+            run(true);
+          });
+          foot.appendChild(again);
+          panel.appendChild(foot);
+        };
+        const run = (force) => {
+          const reader = this.reader();
+          if (!reader) return;
+          panel.textContent = "";
+          panel.appendChild(h("div", null, `${fig.label}을(를) 보고 해석하는 중이에요… (20~40초쯤 걸려요)`)).className = "tyb-figwait";
+          let job = this._figBusy.get(key);
+          if (!job || force) {
+            job = self.figureExplanation(reader, page, fig, force);
+            this._figBusy.set(key, job);
+            job.finally(() => this._figBusy.get(key) === job && this._figBusy.delete(key)).catch(() => {});
+          }
+          job
+            .then((res) => {
+              if (!box.isConnected) return;
+              show(res);
+              setBtn();
+            })
+            .catch((e) => {
+              self.fileLog("figure failed: " + self.errText(e));
+              if (!box.isConnected) return;
+              panel.textContent = e.userFacing ? e.message : "해석하지 못했어요. 다시 눌러 주세요.";
+            });
+        };
+        btn.addEventListener("click", () => {
+          if (this._figOpen.has(key)) this._figOpen.delete(key);
+          else {
+            this._figOpen.add(key);
+            const saved = self.savedFigure(page.itemID, page.pageIndex, fig);
+            if (saved) show(saved);
+            else run(false);
+          }
+          setBtn();
+        });
+        // 다시 그릴 때(쪽 넘김, 형광펜) 펼쳐 둔 상태를 지켜요.
+        if (this._figOpen.has(key)) {
+          const saved = self.savedFigure(page.itemID, page.pageIndex, fig);
+          if (saved) show(saved);
+          else run(false);
+        }
+        setBtn();
+        return box;
       },
 
       onPageReady(itemID, pageIndex, page) {
