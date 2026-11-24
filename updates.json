@@ -3,9 +3,9 @@
     "trans_yb@local.plugin": {
       "updates": [
         {
-          "version": "0.16.3",
-          "update_link": "https://github.com/2yubin/trans_yb/releases/download/v0.16.3/trans_yb.xpi",
-          "update_hash": "sha256:05b9c7d232d36bd50ee8cd95089b6c8f75526e55ce1bf9155141e34e475aeb5c",
+          "version": "0.17.1",
+          "update_link": "https://github.com/2yubin/trans_yb/releases/download/v0.17.1/trans_yb.xpi",
+          "update_hash": "sha256:de585d4226fd3b1de11b5a5fb0fd18260eab0e6d88349145a4258e697d31cc0c",
           "applications": {
             "zotero": {
               "strict_min_version": "10.0"
