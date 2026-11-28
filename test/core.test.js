@@ -143,4 +143,97 @@ t("펼친 책 두 쪽(왼쪽·오른쪽)을 따로 읽어요", () => {
   assert.ok(L.ranges.every((r) => r));
 });
 
+t("OCR이 쉼표를 마침표로 읽은 곳은 대문자로 고치지 않아 문장이 토막 나지 않아요", () => {
+  // Callon(1984) 198쪽: 같은 글에 ". The", ". He"가 멀쩡히 있으니 ". their", ". or"는 깨진 글꼴이 아니에요.
+  const raw = "Others turn to existing social forces. The sociologist tends to censor selectively the actors when they speak of themselves. their allies. their adversaries. or social backgrounds. He allows them to speak only of Nature. The few rare texts differ. or worse. they are used against them.";
+  const fixed = Core.repairBrokenCaps(raw);
+  assert.strictEqual(fixed, raw);
+  const s = Core.splitSentences(fixed).map((p) => fixed.slice(p.start, p.end));
+  assert.ok(s[1].endsWith("or social backgrounds."), JSON.stringify(s));
+});
+
+t("그림 속 화살표를 OCR이 글자로 읽은 키 큰 조각은 문단을 잇지 않아요", () => {
+  // Callon(1984) 217쪽 그림 5: 화살표가 높이 50~85의 "j", "!", "1"로 읽혀 그림 전체를 덮는 문단이 생겼어요.
+  const P = [];
+  const add = (x, y, raw, w, h = 11) => P.push({ raw, x, y, w, h, font: "Helvetica" });
+  add(166, 55, "Fishermen of", 50); add(166, 64, "St Brieuc Bay", 45);
+  add(185, 75, "1", 12, 52); // 화살표
+  add(166, 130, "Election", 30);
+  add(185, 142, "1", 12, 50);
+  add(166, 195, "Counting of votes", 60);
+  for (let i = 0; i < 8; i++) add(55, 420 + i * 12, "Body text of the paper continues here with a long line of words " + i, 285, 13.9);
+  const L = Core.buildLayout(P);
+  const texts = L.paras.map((p) => L.text.slice(p.start, p.end));
+  assert.ok(!texts.some((t) => /Bay.*Election|Election.*Counting/.test(t)), JSON.stringify(texts));
+});
+
+t("다음 단 맨 위에 쪽 번호·머리말이 있어도 앞 단에서 넘어온 문장을 이어요", () => {
+  // Callon(1986) 펼친 책: 왼쪽 쪽 끝 "This is because they are" → 오른쪽 쪽 머리말 "The Sociology of an Actor-Network 21" → "continuously rebuilding ..."
+  const P = [];
+  const line = (x, y, text, w = 300) => P.push({ raw: text, x, y, w, h: 11, font: "Times" });
+  let y = 60;
+  for (let i = 0; i < 12; i++) { line(142, y, "Sociologists often believe that as a profession they can answer this question " + i); y += 12; }
+  line(142, y, "However, scientists and technologists constantly undermine the"); y += 12;
+  line(142, y, "knowledge of the sociologists. This is because they are");
+  line(570, 39, "The Sociology of an Actor-Network 21", 230);
+  y = 62;
+  line(496, y, "continuously rebuilding society by introducing unpredictable variations"); y += 12;
+  for (let i = 0; i < 12; i++) { line(496, y, "and new associations which the actors keep drawing into their world " + i + "."); y += 12; }
+  const L = Core.buildLayout(P);
+  const s = Core.makeUnits(L.text, L.paras.filter((p) => p.kind !== "other")).map((u) => Core.unitSource(L.text, u, L.soft));
+  assert.ok(s.some((x) => /This is because they are continuously rebuilding society/.test(x)), JSON.stringify(s.slice(10, 16)));
+});
+
+t("들여쓰기로 새 문단을 알아봐요(꽉 찬 마지막 줄, OCR이 마침표를 쉼표로 읽은 줄, 여백 손글씨 표시). 참고문헌 내어쓰기는 그대로예요", () => {
+  // Callon(1986) 22쪽 왼쪽: "…his own place."(꽉 찬 줄) / "-- Up to this point"(여백 표시 + 들여쓰기),
+  // "(catalysts, electrons, etc.),"(짧은 줄, 마침표가 쉼표로) / "But just a moment"(들여쓰기)
+  const P = [];
+  const line = (x, y, text, w) => P.push({ raw: text, x, y, w, h: 10.5, font: "Noto" });
+  let y = 60;
+  const full = (t) => { line(141, y, t, 302); y += 12; };
+  for (let i = 0; i < 4; i++) full("The EDF has defined the roles and then attempts to enrol other entities " + i);
+  full("roles together by building a world where everyone has his own place.");
+  line(132, y, "--", 6); line(151, y, "Up to this point, the entities are ones familiar to the sociologist.", 292); y += 12;
+  for (let i = 0; i < 3; i++) full("There are consumers, social movements and ministries which we must list " + i);
+  line(141, y, "(catalysts, electrons, etc.),", 112); y += 12;
+  line(151, y, "But just a moment. EDF is not an actor that is faced with new and", 292); y += 12;
+  for (let i = 0; i < 3; i++) full("unfamiliar technologies or knowledge located throughout the society " + i);
+  // 참고문헌(내어쓰기): 둘째 줄이 들여 써 있고 대문자로 시작해도 같은 항목이에요
+  y += 20;
+  for (let i = 0; i < 4; i++) {
+    line(141, y, "Armijo, Priscila Rodrigues, Julie K. Silver, Allison R.", 302); y += 12;
+    line(151, y, "Larson, and Sash Shillcutt. 2021. Citation Gap. Journal " + i + ".", 292); y += 12;
+  }
+  const L = Core.buildLayout(P);
+  const paras = L.paras.map((p) => L.text.slice(p.start, p.end));
+  assert.ok(paras.some((t) => /^-* *Up to this point/.test(t)), JSON.stringify(paras.map((t) => t.slice(0, 30))));
+  assert.ok(paras.some((t) => /^But just a moment/.test(t)), JSON.stringify(paras.map((t) => t.slice(0, 30))));
+  assert.ok(paras.some((t) => /Allison R\. Larson, and Sash/.test(t)), "참고문헌 항목이 나뉘면 안 돼요");
+});
+
+t("들여쓰기로 문단을 나누는 책에서 다음 쪽 첫 줄이 들여 써 있지 않으면 앞 문단을 이어요(쪽 배율이 달라도)", () => {
+  // Callon(1986) 22→23쪽: "…car manufacturer." / (머리말) / "Indeed, it will never regain that status." (오른쪽 쪽이 25% 크게 스캔됨)
+  const P = [];
+  const line = (x, y, text, w, h) => P.push({ raw: text, x, y, w, h, font: "Noto" });
+  let y = 60;
+  const para = (x0, n, h, first) => {
+    line(x0 + h, y, first, 290, h); y += h * 1.15;
+    for (let i = 0; i < n; i++) { line(x0, y, "the body text continues with ordinary words and more words " + i, 300, h); y += h * 1.15; }
+    line(x0, y, "and it ends here.", 80, h); y += h * 1.15;
+  };
+  para(141, 4, 10.1, "Up to this point the entities are ones familiar to everyone here.");
+  para(141, 4, 10.1, "But just a moment, EDF is not an actor that is faced with things.");
+  line(151, y, "The actor-world not only determines the repertoire of entities.", 290, 10.1); y += 11.6;
+  line(141, y, "company that seeks to be the largest European car manufacturer.", 300, 10.1);
+  // (머리말을 건너뛰는 경우는 위 시험에서 따로 봐요)
+  y = 60;
+  line(492, y, "Indeed, it will never regain that status. Rather, it is reduced.", 300, 13); y += 15;
+  line(492, y, "new demands.", 60, 13); y += 15;
+  para(492, 4, 13, "The notion of the actor-world makes it possible to describe this.");
+  para(492, 4, 13, "In the absence of one ingredient the whole would break down here.");
+  const L = Core.buildLayout(P);
+  const paras = L.paras.map((p) => L.text.slice(p.start, p.end));
+  assert.ok(paras.some((t) => /car manufacturer\. Indeed, it will never regain/.test(t)), JSON.stringify(paras.map((t) => t.slice(-40))));
+});
+
 console.log(`\n${pass}개 시험 모두 통과`);

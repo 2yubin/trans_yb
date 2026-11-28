@@ -364,4 +364,41 @@ t("본문 크기의 기울임 소제목이 연결어로 끝나 두 줄로 나뉘
   assert.ok(heads.includes("Data") && heads.includes("Measures"), JSON.stringify(heads));
 });
 
+t("따로 떨어진 악센트 글자(caf|é)가 줄 뒤쪽 순서로 저장돼도 제자리에 끼워 문단을 끊지 않아요", () => {
+  // Hamilton(2017) 2쪽: "high caf" "density " 다음에 "é"(다른 글꼴, 조금 위)가 저장돼 있어요.
+  const Q = [];
+  let y = 100;
+  const R = "SandSm";
+  const P = (x, text, w) => Q.push({ raw: text, x, y, w, h: 10.9, font: R });
+  for (let i = 0; i < 4; i++) { P(62, "Today, the cafe lives on unperturbed by the relative views of those " + i, 200); y += 13.9; }
+  P(62.6, "long in a country where high caf", 156.8);
+  P(231.4, "density ", 32.7);
+  Q.push({ raw: "é", x: 219.6, y: y - 0.6, w: 5.7, h: 10.6, font: "Haansoft Batang" });
+  y += 13.9;
+  P(62.7, "makes competition fierce, and where homosex- ", 201.4); y += 13.9;
+  P(62.7, "uality is considered weird. This research aims to fill this void.", 180); y += 13.9;
+  const L = Core.buildLayout(Q);
+  const body = L.paras.filter((p) => p.kind === "body").map((p) => L.text.slice(p.start, p.end));
+  assert.strictEqual(body.length, 1, JSON.stringify(body));
+  assert.ok(body[0].includes("high café density makes competition fierce"), body[0]);
+});
+
+t("본문 첫 줄에 인용 연도가 있어도 참고문헌으로 보지 않고, 짧은 마지막 줄 다음 들여 쓴 줄에서 새 문단을 시작해요", () => {
+  // Roseneil·Budgeon(2004) 6쪽: "...(Beck-" / "Gernsheim, 1999)." 다음 줄 "While this body..." 가 들여 써 있어요.
+  const Q = [];
+  let y = 149;
+  const P = (x, text, w) => { Q.push({ raw: text, x, y, w, h: 10.7, font: "Times" }); y += 11.95; };
+  P(148.6, "of \u2018great, and generalizable, importance\u2019 (Giddens, 1992: 2). He charts", 322.8);
+  for (let i = 0; i < 6; i++) P(148.6, "changes in the nature of marriage such as the emergence of the pure relation " + i, 322.8);
+  P(148.6, "same family, we are moving into a world of the \u2018post-familial family\u2019 (Beck-", 322.8);
+  P(148.6, "Gernsheim, 1999).", 78.1);
+  P(166.5, "While this body of work perhaps overstates the degree of change, and", 304.9);
+  for (let i = 0; i < 4; i++) P(148.6, "underplays the continuance of gender inequalities and class differences in " + i, 322.8);
+  const L = Core.buildLayout(Q);
+  const body = L.paras.filter((p) => p.kind === "body").map((p) => L.text.slice(p.start, p.end));
+  assert.strictEqual(body.length, 2, JSON.stringify(body));
+  assert.ok(body[0].endsWith("(Beck-Gernsheim, 1999)."), body[0]);
+  assert.ok(body[1].startsWith("While this body of work"), body[1]);
+});
+
 console.log(`\n${pass}개 시험 모두 통과`);

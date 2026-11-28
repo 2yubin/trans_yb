@@ -560,7 +560,11 @@ var TransYbCore = {
       const mine = one.paras.map((pa) => ({ one, idxs, pa }));
       // 단을 넘어가는 문장: 앞 단의 마지막 본문 문단이 문장 중간에서 끝났고(뒤에는 각주·쪽 번호만 있음),
       // 이 단의 첫 문단이 본문이면 이어 붙여요. 사이에 낀 각주는 이어 붙인 문단 뒤로 보내요.
-      const first = mine[0];
+      // 이 단 맨 위의 머리말·쪽 번호(other)는 건너뛰고 첫 본문 문단을 봐요
+      // (예: 펼친 책 스캔 Callon 1986, 왼쪽 쪽 끝 "they are" → 오른쪽 쪽 머리말 다음 "continuously rebuilding").
+      let fi = 0;
+      while (fi < Math.min(mine.length, 2) && mine[fi].pa.kind === "other") fi++;
+      const first = mine[fi];
       if (first && first.pa.kind === "body") {
         let k = blocks.length - 1;
         while (k >= 0 && (blocks[k].pa.kind === "note" || blocks[k].pa.kind === "other")) k--;
@@ -569,10 +573,18 @@ var TransYbCore = {
         const firstText = first.one.text.slice(first.pa.start, first.pa.end);
         // 글자 크기가 확 다르면(본문 -> 각주·소속 줄) 이어진 문장이 아니에요.
         const sameSize = !host || !host.pa.fh || !first.pa.fh || Math.abs(host.pa.fh - first.pa.fh) < host.pa.fh * 0.15;
-        if (host && host.pa.kind === "body" && sameSize && !endsS(hostText) && /^[\p{Ll}\d(“"‘']/u.test(firstText) && host.idxs !== first.idxs) {
+        // 들여쓰기로 문단을 나누는 글(책)에서 다음 쪽·단의 첫 본문 줄이 들여 써 있지 않으면, 앞 문단이 이어지는 거예요
+        // (예: Callon 1986 22→23쪽 "…car manufacturer." / "Indeed, it will never regain that status.").
+        const hostOne = host && host.one;
+        // (펼친 책 스캔은 두 쪽의 배율이 달라 글자 높이가 25%쯤 다를 수 있어서, 이때는 35%까지 같은 크기로 봐요)
+        const flushCont = one.indentStyle && hostOne && hostOne.indentStyle && first.pa.firstIndent !== undefined &&
+          first.pa.firstIndent < (first.pa.fh || pageH || 10) * 0.35 && /^[\p{Lu}"“‘(]/u.test(firstText) &&
+          (!host.pa.fh || !first.pa.fh || Math.abs(host.pa.fh - first.pa.fh) < Math.max(host.pa.fh, first.pa.fh) * 0.35);
+        if (host && host.pa.kind === "body" && host.idxs !== first.idxs &&
+          ((sameSize && !endsS(hostText) && /^[\p{Ll}\d(“"‘']/u.test(firstText)) || flushCont)) {
           first.join = true;
           first.hy = /[\p{L}]-$/u.test(hostText);
-          blocks.splice(k + 1, 0, mine.shift());
+          blocks.splice(k + 1, 0, mine.splice(fi, 1)[0]);
         }
       }
       blocks.push(...mine);
@@ -629,7 +641,11 @@ var TransYbCore = {
       citeHits[m[2]] = (citeHits[m[2]] || 0) + 1;
       spots.push([m.index + m[1].length, m[2]]);
     }
-    const broken = new Set(Object.keys(counts).filter((c) => counts[c] >= 2 || (counts[c] >= 1 && citeHits[c] >= 1)));
+    // 같은 글자의 대문자가 쪽 어딘가에서 단어 첫머리에 멀쩡히 나오면("The", "Others") 글꼴이 깨진 게 아니에요.
+    // (글꼴이 깨진 PDF는 그 대문자가 쪽 어디에도 없어요.) 스캔 OCR 이 쉼표를 마침표로 잘못 읽은 경우예요
+    // (예: Callon 1984 "themselves. their allies. or social"). 이때 대문자로 고치면 문장이 토막으로 쪼개지니 그대로 둬요.
+    const capsOk = (c) => new RegExp(`(^|[^A-Za-z])${c.toUpperCase()}[a-z]`).test(text);
+    const broken = new Set(Object.keys(counts).filter((c) => (counts[c] >= 2 || (counts[c] >= 1 && citeHits[c] >= 1)) && !capsOk(c)));
     if (!broken.size) return text;
     const chars = text.split("");
     for (const [at, c] of spots) if (broken.has(c) && chars[at] === c) chars[at] = c.toUpperCase();
@@ -652,6 +668,23 @@ var TransYbCore = {
         p.w = n.x - p.x; // 틈 없이 붙어서 띄어 쓰지 않아요
       }
     }
+    const junkHs = []; // 뺀 조각 높이: 글자 크기 흔들림(noise)은 예전처럼 이 조각까지 넣어 재요(다른 판정이 바뀌지 않게)
+    // 0-2) 스캔 OCR 이 그림 속 화살표·선을 글자로 잘못 읽은 조각("j", "!", "1"이 글자 2.5배 넘게 높음)은 빈칸처럼 다뤄요.
+    // 그대로 두면 그림 전체를 덮는 긴 "문단"이 생겨 강조 상자가 길게 그려져요(예: Callon 1984 217쪽 그림 5).
+    // (큰 첫 글자는 위 0) 단계에서 이미 다음 글자 크기로 맞췄어요.)
+    {
+      const hs0 = [];
+      for (const p of pieces) { const n = Math.min(String(p.raw).trim().length, 40); for (let k = 0; k < n; k++) hs0.push(p.h || 10); }
+      hs0.sort((a, b) => a - b);
+      const H0 = baseH || (hs0.length ? hs0[Math.floor(hs0.length / 2)] : 0);
+      if (H0) for (const p of pieces) {
+        const t = String(p.raw).trim();
+        if (t && t.length <= 3 && (p.h || 0) > H0 * 2.5) {
+          junkHs.push(p.h);
+          p.raw = " ";
+        }
+      }
+    }
     // 1) 줄 묶기
     const lines = [];
     let cur = null;
@@ -664,6 +697,22 @@ var TransYbCore = {
       }
       const h = p.h || 10;
       const mid = p.y + h / 2;
+      // 따로 떨어진 악센트 글자(caf|é, ŏ 등): PDF 에 줄 뒤쪽 순서로 저장돼도 같은 높이 줄의 x 자리에 끼워요.
+      // (새 줄로 떼면 문장 한가운데서 문단이 끊겨요. 예: Hamilton 2017, "high caf[é] density")
+      // (글자, 발음 기호, 문장부호 — … 만. 수식 기호 ∑ → 등은 수식 배치를 흔들지 않게 빼요)
+      if (cur && String(p.raw).trim().length === 1 && /^[^\x00-\x7F]$/.test(String(p.raw).trim()) && /^[\p{L}\p{M}\p{P}]$/u.test(String(p.raw).trim()) && p.w < h * 0.9) {
+        const host = lines.slice(-3).reverse().find((l) =>
+          Math.abs(mid - l.mid) < Math.max(h, l.h) * 0.5 && p.x >= l.left - h * 0.3 && p.x <= l.right + h * 0.3);
+        if (host) {
+          const at = host.items.findIndex((it) => it.x > p.x);
+          const item = { idx, t, map, x: p.x, w: p.w, raw: p.raw, font: p.font || "" };
+          if (at < 0) host.items.push(item);
+          else host.items.splice(at, 0, item);
+          host.top = Math.min(host.top, p.y);
+          host.bottom = Math.max(host.bottom, p.y + h);
+          return;
+        }
+      }
       const sameLine =
         cur && Math.abs(mid - cur.mid) < Math.max(h, cur.h) * 0.5 &&
         // (PDF 가 알려 주는 글자 폭이 실제보다 넓어 앞 조각과 겹쳐 보여도, 앞 조각보다 오른쪽에서 시작하면 같은 줄이에요)
@@ -694,8 +743,14 @@ var TransYbCore = {
       ln.chars = ln.items.reduce((n, it) => n + (it.t ? it.t.length : 0), 0);
       ln.firstText = (ln.items.find((it) => it.t) || {}).t || "";
       // 글머리표(•) 다음 글자가 시작하는 위치: 들여쓰기는 이걸로 재요
-      const firstWord = ln.items.find((it) => it.t && !/^[•◦▪●‣∙·]$/.test(it.t));
+      // 스캔 여백의 손글씨 표시를 OCR 이 줄 맨 앞 조각("--", "~", 따로 떨어진 "“")으로 읽으면 건너뛰어요
+      // (예: Callon 1986 22쪽 "-- Up to this point"). 글자나 숫자가 하나도 없는 맨 앞 조각만 건너뛰어요.
+      const words = ln.items.filter((it) => it.t);
+      let fw = 0;
+      while (fw < words.length - 1 && /^[^\p{L}\p{N}]+$/u.test(words[fw].t)) fw++;
+      const firstWord = words[fw];
       ln.textLeft = firstWord ? firstWord.x : ln.left;
+      ln.firstWordText = firstWord ? firstWord.t : "";
     }
     const real = lines.filter((l) => l.text);
     if (!real.length) return { text: "", ranges: pieces.map(() => null), soft: [], paras: [] };
@@ -709,14 +764,14 @@ var TransYbCore = {
     const colWidth = Math.max(1, colRight - colLeft);
     // 여러 줄 제목이 이어지려면: 앞 줄이 단 폭의 60% 이상이거나 연결어로 끝나야 해요(짧은 저자 이름 줄은 따로).
     const titleFlows = (l) => l.right - l.left >= colWidth * 0.75 || /([:,\-–—&/]|\b(of|and|the|in|for|on|to|a|an|with|und|og|y|de)\b)\s*$/i.test(l.text);
-    const lineHs = sorted(real.map((l) => l.fh));
+    const lineHs = sorted(real.map((l) => l.fh).concat(junkHs));
     // 단으로 나눈 경우에는 쪽 전체의 본문 글씨 크기를 기준으로 써요(위쪽 제목 줄만 떼어 낸 작은 덩어리도 제목을 알아보게)
     const H = baseH || lineHs[Math.floor(lineHs.length / 2)];
     // 스캔 OCR 페이지는 줄마다 글자 높이가 들쭉날쭉해요. 흔들림이 크면 "큰 글씨(제목)" 기준을 그만큼 높여요.
     // 흔들림 = 줄 높이가 가운데 값에서 벗어난 정도의 중앙값(보통 PDF는 거의 0)
-    const devs = sorted(real.map((l) => Math.abs(l.fh - H) / Math.max(H, 1)));
+    const devs = sorted(real.map((l) => l.fh).concat(junkHs).map((fh) => Math.abs(fh - H) / Math.max(H, 1)));
     // 줄이 적은 덩어리(첫 쪽 맨 위 제목·서지 줄만 떼어 낸 것 등)는 크기가 원래 제각각이라 흔들림으로 보지 않아요.
-    const noise = real.length >= 10 ? devs[Math.floor(devs.length / 2)] : 0;
+    const noise = real.length + junkHs.length >= 10 ? devs[Math.floor(devs.length / 2)] : 0;
     const BIG = H * Math.min(1.5, 1.15 + Math.max(0, noise - 0.03) * 2.5);
     const gaps = [];
     for (let i = 1; i < real.length; i++) {
@@ -738,6 +793,24 @@ var TransYbCore = {
     const paras = [];
     let para = null;
     let prev = null;
+    // 이 단에서 왼쪽 끝보다 들여 쓴 줄의 비율: 높으면 내어쓰기 구역(참고문헌·목차)이에요.
+    const hangingChunk = (() => {
+      const tls = sorted(real.map((l) => l.textLeft));
+      const base = tls[Math.floor(tls.length * 0.25)];
+      const hh = Math.max(H, 1);
+      const n = real.filter((l) => l.textLeft - base > hh * 0.6 && l.textLeft - base < hh * 4).length;
+      return real.length >= 6 && n / real.length > 0.35;
+    })();
+    // 참고문헌·글머리표 항목(내어쓰기)인지: 첫 줄에 연도나 글머리표가 있으면 항목으로 봐요.
+    // 단, 이어지는 줄이 둘 이상이고 모두 첫 줄과 같은 왼쪽에서 시작하면 본문 문단이에요(첫 줄의 인용 연도 "Giddens, 1992" 때문에 착각하지 않게).
+    const hangingItem = (p) => {
+      const f = p && p.lines[0];
+      if (!f) return false;
+      if (!(/\b(1[6-9]|20)\d{2}[a-z]?\b/.test(f.text) || isBullet(f.firstText))) return false;
+      const rest = p.lines.slice(1);
+      const flush = rest.length >= 2 && rest.every((l) => Math.abs(l.left - f.left) < Math.max(H, 1) * 0.5);
+      return !flush;
+    };
     const startPara = () => {
       if (para) para.end = text.length;
       if (text) text += "\n";
@@ -776,6 +849,22 @@ var TransYbCore = {
           if (short && lnShort && !bigTitleGoesOn && /^[\p{Lu}\d]/u.test(ln.text) && !endsSentence(prev.text)) brk = true;
           // 첫 줄 들여쓰기: 앞 줄이 마침표로 끝나고 오른쪽 끝까지 꽉 차지 않았을 때만(참고문헌 이어지는 줄과 구분)
           if (ln.textLeft > prev.textLeft + h * 0.8 && endsSentence(prev.text) && prev.right < colRight - h * 0.8) brk = true;
+          // 들여쓰기(0.6~4줄 높이)로 시작하는 대문자 줄 = 새 문단. 참고문헌(내어쓰기) 항목 안에서는 빼요.
+          //  - 앞 줄이 문장 끝으로 끝나면 앞 줄이 오른쪽 끝까지 꽉 차 있어도 새 문단(양쪽 맞춤 글의 마지막 줄)
+          //  - 앞 줄이 확실히 짧게 끝났으면 문장부호와 상관없이 새 문단(OCR 이 마침표를 쉼표로 읽은 경우)
+          //    (예: Callon 1986 22쪽 "own place." / "Up to this point", "etc.)," / "But just a moment")
+          {
+            const ind = ln.textLeft - prev.textLeft;
+            const indented = ind > h * 0.6 && ind < h * 4;
+            const upper = /^[\p{Lu}"“‘(]/u.test(ln.firstWordText || "");
+            const pf = para.lines[0];
+            const inRef = hangingItem(para);
+            // 내어쓰기(참고문헌·목차)와 구분: 다음 줄도 같은 만큼 들여 써 있거나, 이 단에 들여 쓴 줄이 많으면(35% 넘게) 쓰지 않아요.
+            const nx = real[real.indexOf(ln) + 1];
+            const hangingNext = nx && nx.top > ln.top && Math.abs(nx.textLeft - ln.textLeft) < h * 0.4;
+            if (indented && upper && !inRef && !hangingChunk && !hangingNext && !isBullet(ln.firstText) &&
+              (endsSentence(prev.text) || prev.right < colRight - h * 5)) brk = true;
+          }
           // 내어쓰기(참고문헌): 문단 첫 줄이 왼쪽 끝이고 이어지는 줄이 들여져 있다가 다시 왼쪽 끝으로 오면 새 항목
           const first = para.lines[0];
           const refLike = /\b(1[6-9]|20)\d{2}[a-z]?\b/.test(first.text) || isBullet(first.firstText);
@@ -808,7 +897,7 @@ var TransYbCore = {
         if (continues) brk = false;
         // 참고문헌·글머리표 항목의 들여 쓴 다음 줄은 같은 항목이에요.
         const pFirst = para && para.lines[0];
-        if (pFirst && (isBullet(pFirst.firstText) || /\b(1[6-9]|20)\d{2}[a-z]?\b/.test(pFirst.text)) && ln.left > pFirst.left + Math.max(H, 1) * 0.5 && !isBullet(ln.firstText) && Math.abs(ln.fh - prev.fh) < prev.fh * 0.25 && ln.top - prev.bottom <= normalGap + Math.max(H, 1) * 0.5) brk = false;
+        if (pFirst && hangingItem(para) && ln.left > pFirst.left + Math.max(H, 1) * 0.5 && !isBullet(ln.firstText) && Math.abs(ln.fh - prev.fh) < prev.fh * 0.25 && ln.top - prev.bottom <= normalGap + Math.max(H, 1) * 0.5) brk = false;
         if (isBullet(ln.firstText)) brk = true;
         // 큰 글씨 제목이 콜론이나 연결어로 끝나고 같은 크기로 이어지면, 줄 사이가 넓어도 같은 제목이에요.
         if (
@@ -843,8 +932,13 @@ var TransYbCore = {
       else {
         // 같은 문단의 다음 줄: 줄 끝 하이픈이면 붙이고, 아니면 띄어 써요.
         const hy = /[\p{L}]-$/u.test(prev.text) && /^\p{Ll}/u.test(ln.text);
+        // 줄 끝 하이픈 다음이 대문자이고, 하이픈 앞 낱말이 대문자로 시작하거나(Beck-/Gernsheim, Euro-/American)
+        // 흔한 접두어면(non-/Western, post-/World) 원래 있는 하이픈이에요. 하이픈은 두고 띄우지 않아요.
+        // (OCR 이 소문자를 대문자로 잘못 읽은 "ap-/Propriate" 같은 줄은 예전처럼 띄어 둬요)
+        const realHy = /^\p{Lu}/u.test(ln.text) &&
+          /(?:^|[\s(“"‘'\[])(?:\p{Lu}\p{L}*|non|anti|post|pre|pro|neo|pan|trans|inter|intra|self|mid|sub|semi|multi|cross|counter|pseudo|quasi|ultra)-$/u.test(prev.text);
         if (hy) soft.push(text.length - 1);
-        else text += " ";
+        else if (!realHy) text += " ";
       }
       // 줄 안의 조각 이어 붙이기
       let lastRight = null;
@@ -934,8 +1028,15 @@ var TransYbCore = {
         if (inNotes || (numbered && footArea)) p.kind = "note";
       }
     });
+    // 문단 첫 줄 들여쓰기(본문 왼쪽 끝 기준). 들여쓰기로 문단을 나누는 글인지도 알려 줘요(쪽을 넘어 문단을 이을 때 써요).
+    {
+      const tls = sorted(real.map((l) => l.textLeft));
+      const baseLeft = tls[Math.floor(tls.length * 0.25)];
+      for (const p of paras) if (p.lines.length) p.firstIndent = p.lines[0].textLeft - baseLeft;
+    }
+    const indentStyle = paras.filter((p) => p.kind === "body" && p.firstIndent > H * 0.6 && p.firstIndent < H * 4).length >= 2;
     for (const p of paras) delete p.lines;
-    return { text, ranges, soft, paras, notesOpen: inNotes };
+    return { text, ranges, soft, paras, notesOpen: inNotes, indentStyle };
   },
 
   /* ---------- OCR 글자 폭 보정 ----------
@@ -1775,6 +1876,17 @@ var TransYb = {
     Zotero.Prefs.set(this.PREF + name, value, true);
   },
 
+  // Claude Code 번역·질문에 쓸 모델. 모델을 정하지 않으면 계정 기본값(보통 Opus)이 돌아서 느려요.
+  // fast = Haiku, balanced = Sonnet(생각 적게), accurate = Opus(계정 기본 설정).
+  CC_SPEED: {
+    fast: ["--model", "haiku"],
+    balanced: ["--model", "sonnet", "--effort", "low"],
+    accurate: ["--model", "opus"],
+  },
+  claudeCodeModelArgs() {
+    return this.CC_SPEED[this.pref("claudeCodeSpeed")] || this.CC_SPEED.balanced;
+  },
+
   /* ---------- 창, 사이드바 등록 ---------- */
 
   addToAllWindows() {
@@ -1801,7 +1913,29 @@ var TransYb = {
   registerPane() {
     this.startObserver();
     this.registerSelectionPopup();
-    this.paneID = Zotero.ItemPaneManager.registerSection({
+    // 업데이트·재설치 때 옛 버전이 칸을 지우지 못하고 꺼지면, 같은 이름이라 새 칸 등록이 거절돼요(paneID false → 옆 아이콘이 안 보여요).
+    // 그럴 때는 남은 옛 칸을 지우고 한 번 더 등록해요. 옛 칸 이름은 조테로 쪽(Zotero 객체)에 적어 둬서 플러그인을 다시 켜도 남아 있어요.
+    this.paneID = this.registerSectionOnce();
+    // 옛 칸 이름: 적어 둔 것이 없으면(옛 버전) 조테로 규칙대로 CSS.escape("<플러그인ID>-<칸 이름>")으로 만들어요.
+    let stale = Zotero._transYbPaneID;
+    if (!this.paneID && !stale) {
+      try {
+        const esc = (typeof CSS !== "undefined" ? CSS : Zotero.getMainWindow().CSS).escape;
+        stale = esc(`${this.id}-trans_yb-pane`);
+      } catch (e) {}
+    }
+    if (!this.paneID && stale) {
+      try {
+        Zotero.ItemPaneManager.unregisterSection(stale);
+      } catch (e) {}
+      this.paneID = this.registerSectionOnce();
+      this.fileLog("pane re-registered after stale section: " + this.paneID);
+    }
+    if (this.paneID) Zotero._transYbPaneID = this.paneID;
+  },
+
+  registerSectionOnce() {
+    return Zotero.ItemPaneManager.registerSection({
       paneID: "trans_yb-pane",
       pluginID: this.id,
       header: {
@@ -1839,12 +1973,19 @@ var TransYb = {
   },
 
   shutdown() {
+    // 칸 등록은 가장 먼저 지워요. 아래 정리 중에 오류가 나도 다음에 켤 때 칸 등록이 거절되지 않게요.
+    if (this.paneID) {
+      try {
+        Zotero.ItemPaneManager.unregisterSection(this.paneID);
+        if (Zotero._transYbPaneID === this.paneID) Zotero._transYbPaneID = null;
+      } catch (e) {}
+      this.paneID = null;
+    }
     this.stopObserver();
     this.unregisterSelectionPopup();
     for (const pane of this.panes) pane.askControl?.cancel?.();
     for (const pane of this.panes) pane.destroy();
     this.panes.clear();
-    if (this.paneID) Zotero.ItemPaneManager.unregisterSection(this.paneID);
     for (const fn of this.cleanups) {
       try {
         fn();
@@ -1962,7 +2103,8 @@ var TransYb = {
       `read in order, the translations of a paragraph form one natural, connected ${lang} paragraph ` +
       `(use connectives and word order that flow across sentence boundaries; do not translate each sentence in isolation). ` +
       `Keep established academic terms in the conventional ${lang} rendering used in sociology` +
-      (target === "ko" ? ` (e.g. intimacy -> 친밀성, social capital -> 사회자본), and add the original term in parentheses the first time a key concept appears on the page` : "") +
+      (target === "ko" ? ` (e.g. intimacy -> 친밀성, social capital -> 사회자본), and add the original term in parentheses the first time a key concept appears on the page. ` +
+        `"young people", "youth", "young adults" -> 청년 by default; use 청소년 only when the text clearly means adolescents or teenagers (e.g. secondary-school students, ages under about 19)` : "") +
       `. Keep citations such as (Giddens 1992), numbers, and formulas exactly as they are. ` +
       `Footnote reference numbers appear glued to a word or punctuation mark (e.g. "Mother14", "market.4"); ` +
       `keep each one glued, with no space, right after the corresponding word or clause in the translation (e.g. "훈이 엄마14", "참여하고 있었다.4"). ` +
@@ -2170,6 +2312,7 @@ var TransYb = {
       "--strict-mcp-config",
       "--setting-sources=",
       "--tools=",
+      ...this.claudeCodeModelArgs(),
       "--json-schema", schema,
       "--system-prompt", system,
       user,
@@ -2258,7 +2401,7 @@ var TransYb = {
       const r = await run(
         bin,
         ["-p", "--output-format", "json", "--no-session-persistence", "--strict-mcp-config", "--setting-sources=", "--tools=",
-          "--json-schema", JSON.stringify(schema), "--system-prompt", system, user],
+          ...this.claudeCodeModelArgs(), "--json-schema", JSON.stringify(schema), "--system-prompt", system, user],
         Zotero.DataDirectory.dir
       );
       try {
@@ -2327,21 +2470,56 @@ var TransYb = {
     "Copy it character for character from that text (same spelling, punctuation, and spacing). Keep it as short as the meaning allows.",
 
   // 번역문 일부 -> 원문의 같은 부분(페이지 글자 위치 [시작, 끝]). 못 찾으면 null(문장 전체로 해요).
+  // 쪽 끝에서 다음 쪽으로 이어지는 문장이면, 원문의 이어지는 부분은 다음 쪽 첫 문장(contPrev)에 있어요. {page, u} 또는 null
+  async nextPart(page, uIdx) {
+    if (!page.sentences[uIdx]?.joinNext) return null;
+    let next = this.layouts.get(page.itemID + ":" + (page.pageIndex + 1));
+    if (!next) {
+      const reader = (Zotero.Reader._readers || []).find((r) => r.itemID === page.itemID);
+      if (reader) next = await this.buildPage(reader, page.pageIndex + 1).catch(() => null);
+    }
+    const u = next ? next.sentences.findIndex((x) => x.contPrev) : -1;
+    return u >= 0 ? { page: next, u } : null;
+  },
+
+  // 번역문 일부 -> 원문의 같은 부분. 쪽을 넘는 문장이면 다음 쪽 부분은 .next 에 담아요.
+  // 이 쪽에는 없고 다음 쪽에만 있으면 start 가 없는 { next } 를 돌려줘요.
   async alignToSource(page, uIdx, koFrom, koTo) {
     const ko = page.lines[uIdx] || "";
     const unit = page.sentences[uIdx];
     const part = ko.slice(koFrom, koTo).trim();
     if (!part || (koFrom <= 0 && koTo >= ko.trim().length)) return null;
-    const src = TransYbCore.unitSource(page.text, unit, page.soft);
+    const own = TransYbCore.unitSource(page.text, unit, page.soft);
+    const nx = await this.nextPart(page, uIdx);
+    const nu = nx && nx.page.sentences[nx.u];
+    const src = nu ? own + " " + TransYbCore.unitSource(nx.page.text, nu, nx.page.soft) : own;
     const ans = await this.askJSON(
       this.ALIGN_SYSTEM,
       `Source sentence:\n${src}\n\nTranslation:\n${ko}\n\nSelected part of the translation:\n${part}\n\nReturn {"match": the corresponding substring of the SOURCE sentence}.`,
       { type: "object", properties: { match: { type: "string" } }, required: ["match"], additionalProperties: false }
     );
     if (!ans?.match) return null;
-    const r = TransYbCore.findInUnit(page.text, unit, page.soft, ans.match);
-    this.fileLog(`align ko->src: "${part.slice(0, 30)}" -> "${String(ans.match).slice(0, 40)}" ${r ? "found" : "not found"}`);
-    return r ? { start: r[0], end: r[1], text: ans.match } : null;
+    const m = String(ans.match);
+    const r = TransYbCore.findInUnit(page.text, unit, page.soft, m);
+    let out = r ? { start: r[0], end: r[1], text: m } : null;
+    if (!out && nu) {
+      const inNext = (t) => TransYbCore.findInUnit(nx.page.text, nu, nx.page.soft, t);
+      const rn = inNext(m);
+      if (rn) out = { next: { start: rn[0], end: rn[1], text: m } };
+      else {
+        // 쪽 경계에 걸친 부분: 낱말 단위로 앞은 이 쪽, 뒤는 다음 쪽에서 찾아요.
+        const w = m.trim().split(/\s+/);
+        for (let k = w.length - 1; k >= 1 && !out; k--) {
+          const a = w.slice(0, k).join(" ");
+          const b = w.slice(k).join(" ");
+          const ra = TransYbCore.findInUnit(page.text, unit, page.soft, a);
+          const rb = ra && inNext(b);
+          if (rb) out = { start: ra[0], end: ra[1], text: a, next: { start: rb[0], end: rb[1], text: b } };
+        }
+      }
+    }
+    this.fileLog(`align ko->src: "${part.slice(0, 30)}" -> "${m.slice(0, 40)}" ${out ? (out.next ? (out.start != null ? "found across pages" : "found on next page") : "found") : "not found"}`);
+    return out;
   },
 
   // 원문 일부 -> 번역문의 같은 부분 [from, to]. 못 찾으면 null(문장 전체로 해요).
@@ -2862,16 +3040,32 @@ var TransYb = {
     if (!rec) return;
     const win = Zotero.getMainWindow();
     if (rec._timer) win.clearTimeout(rec._timer);
-    rec._timer = win.setTimeout(async () => {
-      try {
-        await Zotero.File.createDirectoryIfMissingAsync(this.cacheDir(), { from: Zotero.DataDirectory.dir });
-        await Zotero.File.putContentsAsync(
-          this.cacheDir() + "/" + rec.key + ".json",
-          JSON.stringify({ pages: rec.pages, underlines: rec.underlines, boiler: rec.boiler || [], notes: rec.notes || {}, meta: rec.meta || {}, figs: rec.figs || {} })
-        );
-      } catch (e) {
-        this.fileLog("cache save failed: " + this.errText(e));
-      }
+    rec._timer = win.setTimeout(() => {
+      // 저장은 한 번에 하나씩 차례로 해요. 조테로는 <키>.json.tmp 에 쓴 뒤 이름을 바꾸는데,
+      // 두 저장이 겹치면 Windows 에서는 파일이 잠겨 실패할 수 있어요(백신, OneDrive 가 잠깐 잡고 있을 때도).
+      // 실패하면 0.5초, 1.5초, 3초 뒤에 다시 시도해요. 쓰는 순간의 최신 내용을 저장해요.
+      const write = async () => {
+        const delays = [500, 1500, 3000];
+        for (let attempt = 0; ; attempt++) {
+          try {
+            await Zotero.File.createDirectoryIfMissingAsync(this.cacheDir(), { from: Zotero.DataDirectory.dir });
+            await Zotero.File.putContentsAsync(
+              this.cacheDir() + "/" + rec.key + ".json",
+              JSON.stringify({ pages: rec.pages, underlines: rec.underlines, boiler: rec.boiler || [], notes: rec.notes || {}, meta: rec.meta || {}, figs: rec.figs || {} })
+            );
+            if (attempt) this.fileLog(`cache save ok after ${attempt} retr${attempt > 1 ? "ies" : "y"}: ${rec.key}`);
+            return;
+          } catch (e) {
+            if (attempt >= delays.length) {
+              this.fileLog("cache save failed: " + this.errText(e));
+              return;
+            }
+            this.fileLog(`cache save retry ${attempt + 1}: ${this.errText(e)}`);
+            await new Promise((r) => win.setTimeout(r, delays[attempt]));
+          }
+        }
+      };
+      rec._saving = (rec._saving || Promise.resolve()).then(write, write);
     }, 600);
   },
 
@@ -3608,9 +3802,19 @@ var TransYb = {
         const list = rec.underlines[pageIndex];
         for (let i = list.length - 1; i >= 0; i--) {
           const x = list[i];
+          // 다음 쪽 부분(ann2)만 원문에서 지웠으면 그 연결만 끊어요
+          if (x.ann2 && changed.has(x.ann2) && changed.get(x.ann2) === null) {
+            delete x.ann2;
+            dirty = true;
+          }
           if (!x.ann || !changed.has(x.ann)) continue;
           const c = changed.get(x.ann);
-          if (c === null) {
+          if (c === null && x.ann2) {
+            // 이 쪽 부분만 지웠으면 다음 쪽 부분이 남아 있으니 번역문 표시는 그대로 둬요
+            x.ann = x.ann2;
+            delete x.ann2;
+            dirty = true;
+          } else if (c === null) {
             list.splice(i, 1);
             dirty = true;
           } else if (["highlight", "underline"].includes(c.type) && (c.color !== x.color || c.type !== x.type)) {
@@ -3735,15 +3939,28 @@ var TransYb = {
         if (!whole) range = await this.alignToSource(page, rec.u, rec.from, rec.to);
         if (whole) {
           // 문장 전체: 같은 문장, 같은 종류, 같은 색의 원문 주석이 있으면 같이 써요
-          rec.ann = list.find((x) => x !== rec && x.u === rec.u && x.type === rec.type && x.color === rec.color && x.ann && x.whole)?.ann || null;
-          if (!rec.ann) rec.ann = await this.createMarkAnnotation(page, rec.u, rec.type, rec.color);
+          const same = list.find((x) => x !== rec && x.u === rec.u && x.type === rec.type && x.color === rec.color && x.ann && x.whole);
+          rec.ann = same?.ann || null;
+          if (same?.ann2) rec.ann2 = same.ann2;
+          if (!rec.ann) {
+            rec.ann = await this.createMarkAnnotation(page, rec.u, rec.type, rec.color);
+            // 다음 쪽으로 이어지는 문장이면 다음 쪽의 이어지는 부분도 칠해요
+            const nx = await this.nextPart(page, rec.u);
+            if (nx) rec.ann2 = await this.createMarkAnnotation(nx.page, nx.u, rec.type, rec.color);
+          }
           rec.whole = true;
         } else if (!range) {
           // 같은 부분을 못 찾았어요(예: 사용 한도). 우선 문장 전체에 칠해 두고, 다음에 이 쪽을 열 때 다시 찾아 일부분으로 바꿔요.
           rec.ann = await this.createMarkAnnotation(page, rec.u, rec.type, rec.color);
           rec.pending = true;
         } else {
-          rec.ann = await this.createMarkAnnotation(page, rec.u, rec.type, rec.color, range);
+          if (range.start != null) rec.ann = await this.createMarkAnnotation(page, rec.u, rec.type, rec.color, range);
+          if (range.next) {
+            const nx = await this.nextPart(page, rec.u);
+            const k = nx && (await this.createMarkAnnotation(nx.page, nx.u, rec.type, rec.color, range.next));
+            if (k && rec.ann) rec.ann2 = k;
+            else if (k) rec.ann = k;
+          }
         }
       } catch (e) {
         this.fileLog("annotation create failed: " + this.errText(e));
@@ -3816,7 +4033,13 @@ var TransYb = {
         }
       }
       if (!range) continue; // 다음에 다시 해요
-      const newKey = await this.createMarkAnnotation(page, rec.u, rec.type, rec.color, range);
+      let newKey = range.start != null ? await this.createMarkAnnotation(page, rec.u, rec.type, rec.color, range) : null;
+      if (range.next && !rec.ann2) {
+        const nx = await this.nextPart(page, rec.u);
+        const k = nx && (await this.createMarkAnnotation(nx.page, nx.u, rec.type, rec.color, range.next));
+        if (k && newKey) rec.ann2 = k;
+        else if (k) newKey = k;
+      }
       if (!newKey) continue;
       const old = rec.ann;
       rec.ann = newKey;
@@ -3849,7 +4072,8 @@ var TransYb = {
 
   async removeMarks(page, pieces) {
     const list = this.underlinesFor(page.itemID, page.pageIndex);
-    const before = new Set(list.map((x) => x.ann).filter(Boolean));
+    const keysOf = (l) => new Set(l.flatMap((x) => [x.ann, x.ann2]).filter(Boolean));
+    const before = keysOf(list);
     for (const pc of pieces) {
       for (let i = list.length - 1; i >= 0; i--) {
         const x = list[i];
@@ -3861,7 +4085,7 @@ var TransYb = {
       }
     }
     // 더 이상 어떤 번역문 표시도 쓰지 않는 원문 주석은 지워요.
-    const after = new Set(list.map((x) => x.ann).filter(Boolean));
+    const after = keysOf(list);
     for (const key of before) if (!after.has(key)) await this.deleteAnnotation(page.itemID, key);
     this.saveDisk(page.itemID);
   },
@@ -4072,7 +4296,7 @@ var TransYb = {
     for (const pane of this.panes) pane.markRow(reader.itemID, pi, sIdx, true);
   },
 
-  /* ---------- AI에게 묻기 ---------- */
+  /* ---------- AI에게 물어보기 ---------- */
 
   paperTexts: new Map(), // itemID -> 논문 전체 글자([N쪽] 표시 포함)
   chats: new Map(), // itemID -> [{ q, quote, a }]
@@ -4141,7 +4365,7 @@ var TransYb = {
     return msg;
   },
 
-  // 질문을 보내고 답(글자)을 돌려줘요. Claude Code가 있으면 그것을, 없으면 Claude API 키를 써요.
+  // 질문을 보내고 답(글자)을 돌려줘요. 번역 엔진 설정에서 고른 엔진(Claude Code, Codex, Gemini, Claude API)을 써요.
   // control.cancel() 을 부르면 도중에 멈춰요.
   async askAI(reader, question, quote, control = {}) {
     const paper = await this.paperText(reader);
@@ -4152,10 +4376,130 @@ var TransYb = {
     const history = this.chats.get(reader.itemID) || [];
     const system = this.askSystemPrompt();
     const user = this.askUserMessage(paper, history, quote, question);
+    // 번역 엔진 설정에서 고른 엔진으로 물어봐요. Google 은 질문에 답할 수 없어서 Claude Code → Claude API 순서로 대신 써요.
+    const engine = this.pref("engine") || "claude-code";
+    if (engine === "codex") return this.askCodex(system, user, control);
+    if (engine === "antigravity") return this.askAgy(system, user, control);
+    if (engine === "claude") {
+      if (!String(this.pref("anthropicKey") || "").trim()) throw this.userErr("Claude API 키가 없어요. 번역 엔진 설정에서 키를 넣어 주세요.");
+      return this.askClaudeAPI(system, user);
+    }
     const bin = this.findClaudeCode();
     if (bin) return this.askClaudeCode(bin, system, user, control);
     if (String(this.pref("anthropicKey") || "").trim()) return this.askClaudeAPI(system, user);
+    if (engine === "google") throw this.userErr("Google 번역 엔진으로는 질문에 답할 수 없어요. 번역 엔진 설정에서 Claude Code, Codex, Gemini, Claude API 중 하나를 골라 주세요.");
     throw this.userErr("Claude Code를 찾지 못했고 Claude API 키도 없어요. 번역 엔진 설정을 확인해 주세요.");
+  },
+
+  // 프로그램을 실행하고 input 을 표준 입력으로 넘겨요(논문 전체는 Windows 명령줄 길이 제한 약 3만 2천 자를 넘어서요).
+  // control.cancel() 을 부르면 프로그램을 꺼요.
+  async runPiped(bin, args, workdir, input, control, label) {
+    const { Subprocess } = ChromeUtils.importESModule("resource://gre/modules/Subprocess.sys.mjs");
+    const home = Services.dirsvc.get("Home", Ci.nsIFile).path;
+    let proc;
+    try {
+      proc = await Subprocess.call({
+        command: bin,
+        arguments: args,
+        workdir,
+        environment: { HOME: home, PATH: "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:" + home + "/.local/bin" },
+        environmentAppend: true,
+        stderr: "pipe",
+      });
+    } catch (e) {
+      this.fileLog(`ask ${label} start failed: ` + this.errText(e));
+      throw this.userErr(`${label}를 실행하지 못했어요.`);
+    }
+    control.cancel = () => {
+      control.cancelled = true;
+      try {
+        proc.kill();
+      } catch (e) {}
+    };
+    const readAll = async (pipe) => {
+      let out = "";
+      let chunk;
+      while ((chunk = await pipe.readString())) out += chunk;
+      return out;
+    };
+    const reading = Promise.all([readAll(proc.stdout), readAll(proc.stderr)]);
+    try {
+      await proc.stdin.write(new TextEncoder().encode(input));
+    } catch (e) {
+      this.fileLog(`ask ${label} stdin failed: ` + this.errText(e));
+    }
+    try {
+      await proc.stdin.close();
+    } catch (e) {}
+    const [stdout, stderr] = await reading;
+    const { exitCode } = await proc.wait();
+    if (control.cancelled) throw this.userErr("멈췄어요.");
+    return { stdout, stderr, exitCode };
+  },
+
+  // Codex: "codex exec -" 는 지시문 전체를 표준 입력으로 받아요. 읽기 전용으로, 빈 작업 폴더에서 실행해요.
+  async askCodex(system, user, control) {
+    const bin = this.findCodex();
+    if (!bin) throw this.userErr("이 컴퓨터에서 Codex를 찾지 못했어요. 번역 엔진 설정에서 다른 엔진을 골라 주세요.");
+    const work = Zotero.DataDirectory.dir + "/trans_yb/codex";
+    await Zotero.File.createDirectoryIfMissingAsync(work, { from: Zotero.DataDirectory.dir });
+    const op = work + "/answer-" + Date.now() + ".txt";
+    const started = Date.now();
+    const r = await this.runPiped(
+      bin,
+      ["exec", "--ephemeral", "--skip-git-repo-check", "-s", "read-only", "-C", work, "-o", op, "-"],
+      work,
+      system + "\n\n" + user,
+      control,
+      "Codex"
+    );
+    let answer = "";
+    try {
+      answer = String(await Zotero.File.getContentsAsync(op)).trim();
+      Zotero.File.removeIfExists(op);
+    } catch (e) {}
+    if (!answer || r.exitCode !== 0) {
+      const tail = (r.stderr || r.stdout || "exit " + r.exitCode).slice(-500);
+      this.fileLog("ask codex error: " + tail);
+      if (/log ?in|auth|sign in|unauthorized/i.test(tail)) throw this.userErr("Codex에 로그인이 안 되어 있어요. 터미널에서 codex login 을 해 주세요.");
+      if (/limit|quota|usage|rate/i.test(tail)) throw this.userErr("Codex 사용 한도에 걸렸어요. 잠시 뒤 다시 물어봐 주세요.");
+      if (/too long|context|too large/i.test(tail)) throw this.userErr("논문이 너무 길어서 한 번에 보내지 못했어요.");
+      throw this.userErr("Codex에게서 답을 받지 못했어요.");
+    }
+    this.fileLog(`ask codex ok: ${Date.now() - started} ms`);
+    return answer;
+  },
+
+  // Gemini(Antigravity CLI): 공식 문서의 stream-json 입력으로 논문 전체를 표준 입력에 넘겨요.
+  // agy 에는 시스템 프롬프트 옵션이 없어서 지시문을 질문 앞에 붙여요.
+  async askAgy(system, user, control) {
+    const bin = this.findAntigravity();
+    if (!bin) throw this.userErr("이 컴퓨터에서 Antigravity CLI(agy)를 찾지 못했어요. 설치한 뒤 터미널에서 agy 를 한 번 실행해 Google 계정으로 로그인해 주세요.");
+    const work = Zotero.DataDirectory.dir + "/trans_yb/agy";
+    await Zotero.File.createDirectoryIfMissingAsync(work, { from: Zotero.DataDirectory.dir });
+    const args = ["--input-format", "stream-json", "--output-format", "stream-json", "--disable-slash-commands", "--print-timeout", "300s"];
+    const model = String(this.pref("agyModel") || "").trim();
+    if (model) args.push("--model", model);
+    const line = JSON.stringify({ event: "user", message: { content: system + "\n\nDo not use any tools. Answer directly from the paper below.\n\n" + user } }) + "\n";
+    const r = await this.runPiped(bin, args, work, line, control, "Antigravity CLI");
+    let res = null;
+    for (const l of String(r.stdout).split("\n")) {
+      try {
+        const e = JSON.parse(l);
+        if (e.event === "result") res = e.result;
+      } catch (e) {}
+    }
+    if (!res || res.status !== "SUCCESS" || !String(res.response || "").trim()) {
+      const detail = String((res && res.error) || r.stderr || "exit " + r.exitCode);
+      this.fileLog("ask agy error: " + detail.slice(0, 500));
+      if (/authenticat|log ?in|sign in|credential/i.test(detail)) throw this.userErr("Antigravity CLI에 로그인이 안 되어 있어요. 터미널에서 agy 를 한 번 실행해 Google 계정으로 로그인해 주세요.");
+      if (/capacity|unavailable|503|time ?out|timed out|deadline/i.test(detail)) throw this.userErr("Gemini 서버가 붐벼서 답을 받지 못했어요. 잠시 뒤 다시 물어봐 주세요.");
+      if (/quota|limit|rate|exhausted|credits/i.test(detail)) throw this.userErr("Antigravity(Gemini) 사용 한도에 걸렸어요. 무료 계정은 한도가 매주 다시 채워져요.");
+      throw this.userErr("Gemini에게서 답을 받지 못했어요: " + detail.slice(0, 120));
+    }
+    const u = res.usage || {};
+    this.fileLog(`ask agy ok: ${res.duration_seconds} s, in ${u.input_tokens || 0} / out ${u.output_tokens || 0} tokens`);
+    return String(res.response).trim();
   },
 
   async askClaudeCode(bin, system, user, control) {
@@ -4168,6 +4512,7 @@ var TransYb = {
       "--strict-mcp-config",
       "--setting-sources=",
       "--tools=",
+      ...this.claudeCodeModelArgs(),
       "--system-prompt", system,
     ];
     const { Subprocess } = ChromeUtils.importESModule("resource://gre/modules/Subprocess.sys.mjs");
@@ -4284,7 +4629,7 @@ var TransYb = {
     await note.saveTx();
   },
 
-  // PDF에서 글을 고르면 뜨는 조테로 팝업에 "AI에게 묻기" 단추를 붙여요.
+  // PDF에서 글을 고르면 뜨는 조테로 팝업에 "AI에게 물어보기" 단추를 붙여요.
   registerSelectionPopup() {
     this._onSelPopup = (event) => {
       try {
@@ -4292,7 +4637,7 @@ var TransYb = {
         const text = String(params?.annotation?.text || "").trim();
         if (!text) return;
         const b = doc.createElement("button");
-        b.textContent = "AI에게 묻기";
+        b.textContent = "AI에게 물어보기";
         b.setAttribute(
           "style",
           "display:block;width:calc(100% - 8px);margin:6px 4px 2px;padding:4px 8px;border-radius:5px;" +
@@ -4614,8 +4959,8 @@ var TransYb = {
     arrowEl.className = "tyb-glyph";
     bar.append(langSel, arrowEl, btn);
 
-    // ---------- AI에게 묻기 ----------
-    const askBox = this.makeToggle(h, "AI에게 묻기", "askOpen");
+    // ---------- AI에게 물어보기 ----------
+    const askBox = this.makeToggle(h, "AI에게 물어보기", "askOpen");
     const askInner = h("div");
     askInner.className = "tyb-ask";
     const chatEl = h("div");
@@ -4631,7 +4976,7 @@ var TransYb = {
     const askInput = h("textarea");
     askInput.className = "tyb-askbox";
     askInput.rows = 3;
-    askInput.placeholder = "논문에서 이해 안 되는 부분을 물어보세요.\nPDF에서 글을 드래그해 'AI에게 묻기'를 눌러도 돼요.\nEnter 보내기 · Shift+Enter 줄바꿈";
+    askInput.placeholder = "논문에서 이해 안 되는 부분을 물어보세요.\nPDF에서 글을 드래그해 'AI에게 물어보기'를 눌러도 돼요.\nEnter 보내기 · Shift+Enter 줄바꿈";
     const askFoot = h("div");
     askFoot.className = "tyb-askfoot";
     const askStat = h("span");
@@ -4817,9 +5162,35 @@ var TransYb = {
       keyInput.value = "";
       keyInput.placeholder = "키 저장됨";
     });
+    // Claude Code 속도(모델) 고르기
+    const speedBox = h("div");
+    speedBox.className = "tyb-sub";
+    speedBox.style.paddingTop = "0";
+    const speedSeg = h("div");
+    speedSeg.className = "tyb-seg";
+    const speedNote = h("div", "font-size:.8em;margin-top:4px;");
+    const SPEEDS = [["fast", "빠름", "Haiku: 가장 빨라요. 어려운 문장은 덜 매끄러울 수 있어요."], ["balanced", "보통", "Sonnet: 빠르고 번역도 자연스러워요(기본)."], ["accurate", "정확", "Opus: 가장 꼼꼼하지만 가장 느려요."]];
+    const speedBtns = [];
+    const selectSpeed = (code) => {
+      for (const b of speedBtns) b.classList.toggle("on", b._code === code);
+      speedNote.textContent = (SPEEDS.find((x) => x[0] === code) || SPEEDS[1])[2];
+    };
+    for (const [code, label] of SPEEDS) {
+      const b = h("button", null, label);
+      b._code = code;
+      b.addEventListener("click", () => {
+        this.setPref("claudeCodeSpeed", code);
+        selectSpeed(code);
+      });
+      speedBtns.push(b);
+      speedSeg.appendChild(b);
+    }
+    speedBox.append(speedSeg, speedNote);
+    selectSpeed(this.CC_SPEED[this.pref("claudeCodeSpeed")] ? this.pref("claudeCodeSpeed") : "balanced");
     const selectEngine = (code) => {
       for (const b of segBtns) b.classList.toggle("on", b._code === code);
       keyBox.style.display = code === "claude" ? "" : "none";
+      speedBox.style.display = code === "claude-code" ? "" : "none";
     };
     for (const [code, label] of ENGINES) {
       const b = h("button", null, label);
@@ -4845,7 +5216,7 @@ var TransYb = {
     autoRow.style.paddingBlock = "7px";
     const ver = h("div", null, "trans_yb " + (this.version || ""));
     ver.className = "tyb-foot";
-    settings.body.append(segWrap, keyBox, ver);
+    settings.body.append(segWrap, keyBox, speedBox, ver);
 
     // ---------- 미리 번역 ----------
     const pre = this.makeToggle(h, "미리 번역 설정", "prefetchOpen");
@@ -4953,7 +5324,8 @@ var TransYb = {
     noteSrc.className = "tyb-note-src";
     notePop.append(noteHead, noteBody, noteSrc);
     noteClose.addEventListener("click", () => (notePop.style.display = "none"));
-    wrap.append(bar, askBox.root, styleBox.root, settings.root, pre.root, status, metaEl, listWrap, selBar, notePop);
+    // "AI에게 물어보기"는 설정 칸들 맨 마지막(미리 번역 설정 다음)에 둬요.
+    wrap.append(bar, styleBox.root, settings.root, pre.root, askBox.root, status, metaEl, listWrap, selBar, notePop);
     body.appendChild(wrap);
 
     const self = this;
@@ -5675,7 +6047,13 @@ var TransYb = {
       readSelection() {
         const sel = doc.getSelection?.() || doc.defaultView.getSelection();
         if (!sel || sel.isCollapsed || !sel.rangeCount) return null;
-        const r = sel.getRangeAt(0);
+        // 선택이 여러 조각(range)으로 나뉘어 올 때가 있어요(예: 각주 번호 위첨자를 지나갈 때). 첫 조각 시작부터 끝 조각 끝까지 하나로 봐요.
+        const r = sel.getRangeAt(0).cloneRange();
+        for (let k = 1; k < sel.rangeCount; k++) {
+          const rk = sel.getRangeAt(k);
+          if (r.compareBoundaryPoints(r.START_TO_START, rk) > 0) r.setStart(rk.startContainer, rk.startOffset);
+          if (r.compareBoundaryPoints(r.END_TO_END, rk) < 0) r.setEnd(rk.endContainer, rk.endOffset);
+        }
         if (!list.contains(r.commonAncestorContainer)) return null;
         const block = [...this.blocks.values()].find((b) => b.el.contains(r.startContainer));
         if (!block) return null;
